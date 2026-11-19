@@ -1,8 +1,20 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b3a875a..8cf4c19 100644
+index b3a875a..bbfa59e 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -414,11 +414,33 @@ set(BUILD_TESTING OFF)
+@@ -23,6 +23,11 @@ if (CMAKE_GENERATOR MATCHES "Ninja" AND WIN32)
+ endif()
+ 
+ include(DetectPlatform)
++
++if (NINTENDO_SWITCH2)
++    # Horizon no tiene libdl (ni carga dinámica); FindOpenSSL lo añadiría como -ldl.
++    set(CMAKE_DL_LIBS "")
++endif()
+ include(DetectArchitecture)
+ include(DefaultConfig)
+ include(UseLTO)
+@@ -414,11 +419,33 @@ set(BUILD_TESTING OFF)
  set(ENABLE_TESTING OFF)
  
  # boost
@@ -38,7 +50,7 @@ index b3a875a..8cf4c19 100644
  # really annoying thing where boost::headers doesn't work with cpm
  # TODO(crueter) investigate
  set(BOOST_NO_HEADERS ${Boost_ADDED})
-@@ -563,7 +585,7 @@ if (NOT YUZU_STATIC_ROOM)
+@@ -563,7 +590,7 @@ if (NOT YUZU_STATIC_ROOM)
          find_package(oaknut)
      endif()
  
