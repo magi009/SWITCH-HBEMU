@@ -101,18 +101,18 @@ export DEVKITPRO=/opt/devkitpro
 
 ## Lo que falta, por orden
 
-**Fase 0: que enlace (lo siguiente).** Eden depende de bibliotecas que no están en los
-portlibs de Switch 2. Hay que compilarlas con `switch2vars.sh` o hacerles un parche:
+**Fase 0: que enlace (casi lista).** El CI (`.github/workflows/build-switch2.yml`)
+compila con devkitA64 GCC 15.2 + ounce-devkit 20261117:
 
-- **Boost:** context (las fibras usan `fcontext` aarch64/ELF, que debería funcionar),
-  asio y el resto.
-- **OpenSSL o mbedTLS, Opus, zstd, lz4, fmt, nlohmann_json, simpleini y frozen.**
-- **sirit, SPIRV-Headers y SPIRV-Tools:** los shaders de Maxwell se traducen a SPIR-V.
-- **FFmpeg:** solo si quieres vídeos. Por ahora NVDEC está apagado.
-- **`src/network`:** usa sockets BSD, y libnx los tiene (`socketInitialize`).
+- Hecho: OpenSSL 3.6.2 para Switch 2 (`ci/build-openssl.sh`); FFmpeg, zstd, lz4 y
+  Opus de los portlibs o de CPM; Boost sin Process ni Filesystem.
+- Hecho: los ~2.400 archivos de Eden compilan. Se quitaron o vaciaron el
+  depurador GDB, HTTP (hydrocarbon), el cliente UDP de mandos, renderdoc y
+  `signal_chain`.
+- Pendiente: confirmar que el enlace final de `eden.nro` pasa. El último run se cayó
+  solo por símbolos (dav1d, zlib, `pipe`), y ya están arreglados.
 
-Puede que aparezcan más rutas POSIX que la revisión con headers de host no detectó:
-nombres de hilos, prioridades, `std::filesystem` en devkitA64, `sysconf`, etc.
+Puede que aparezcan más funciones POSIX que newlib no tiene al probar en la consola.
 
 **Fase 1: arrancar homebrew.** Probar primero con `.nro` caseros (más fácil de depurar
 que un juego comercial). Medir el coste por IPC de `kaihenJitPublishRanges`. Si es alto,
