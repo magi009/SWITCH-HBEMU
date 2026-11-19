@@ -86,11 +86,11 @@ jobs:
           git -C eden fetch -q --depth 1 origin "$(cat patches/BASE_COMMIT)"
           git -C eden checkout -q FETCH_HEAD
 
-      - name: Caché de ccache
-        uses: actions/cache@v4
+      - name: Restaurar ccache
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
-          key: ccache-${{ github.sha }}
+          key: ccache-${{ github.sha }}-${{ github.run_attempt }}
           restore-keys: ccache-
 
       - name: Compilar eden.nro
@@ -99,6 +99,15 @@ jobs:
           # -k 0: seguir compilando tras un error para ver TODOS los fallos de una vez.
           BUILD_ARGS="-- -k 0" ./build.sh "$PWD/eden" 2>&1 | tee build.log
           ccache -s || true
+
+      # Guardar ccache aunque la compilación falle: así el siguiente intento
+      # solo recompila lo que cambió (en vez de ~1,5 h desde cero).
+      - name: Guardar ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.sha }}-${{ github.run_attempt }}
 
       - name: Resumen de errores
         if: always()
