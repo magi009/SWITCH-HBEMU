@@ -1,0 +1,6 @@
+build-switch2/
+*.nro
+*.elf
+*.nacp
+*.keys
+/eden/

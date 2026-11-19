@@ -1,0 +1,1643 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b3a875a..a5e956a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -563,7 +563,7 @@ if (NOT YUZU_STATIC_ROOM)
+         find_package(oaknut)
+     endif()
+ 
+-    if (NOT ANDROID)
++    if (NOT ANDROID AND NOT NINTENDO_SWITCH2)
+         find_package(SDL3)
+     endif()
+ 
+diff --git a/externals/CMakeLists.txt b/externals/CMakeLists.txt
+index 194d315..6b80d98 100644
+--- a/externals/CMakeLists.txt
++++ b/externals/CMakeLists.txt
+@@ -139,6 +139,8 @@ if(ENABLE_CUBEB)
+     endif()
+ endif()
+ 
++# Switch 2: no hay SDL3 para libounce; vídeo, entrada y audio son nativos (src/eden_ounce).
++if (NOT NINTENDO_SWITCH2)
+ if (NOT YUZU_USE_BUNDLED_SDL3)
+     if (NOT WIN32)
+         # Yuzu itself needs: Atomic Audio Events Joystick Haptic Sensor Threads Timers
+@@ -182,6 +184,7 @@ if (NOT TARGET SDL3::SDL3)
+         message(FATAL_ERROR "SDL3 package found, but no usable SDL3 target was exported")
+     endif()
+ endif()
++endif() # NOT NINTENDO_SWITCH2
+ 
+ # SPIRV Headers
+ AddJsonPackage(spirv-headers)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 305c744..7f10195 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -321,6 +321,10 @@ add_subdirectory(video_core)
+ add_subdirectory(hid_core)
+ add_subdirectory(input_common)
+ add_subdirectory(frontend_common)
++if (NINTENDO_SWITCH2)
++    # Frontend nativo para Switch 2 (libounce + OunceVK + kaiHEN)
++    add_subdirectory(eden_ounce)
++endif()
+ add_subdirectory(shader_recompiler)
+ 
+ if (YUZU_TESTS)
+diff --git a/src/audio_core/CMakeLists.txt b/src/audio_core/CMakeLists.txt
+index b244d65..a50d2cb 100644
+--- a/src/audio_core/CMakeLists.txt
++++ b/src/audio_core/CMakeLists.txt
+@@ -238,11 +238,13 @@ if (ENABLE_CUBEB)
+     target_compile_definitions(audio_core PRIVATE HAVE_CUBEB=1)
+ endif()
+ 
+-target_sources(audio_core PRIVATE
+-    sink/sdl3_sink.cpp
+-    sink/sdl3_sink.h)
++if (NOT NINTENDO_SWITCH2)
++    target_sources(audio_core PRIVATE
++        sink/sdl3_sink.cpp
++        sink/sdl3_sink.h)
+ 
+-target_link_libraries(audio_core PRIVATE SDL3::SDL3)
+-target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
++    target_link_libraries(audio_core PRIVATE SDL3::SDL3)
++    target_compile_definitions(audio_core PRIVATE HAVE_SDL3)
++endif()
+ 
+ create_target_directory_groups(audio_core)
+diff --git a/src/common/dynamic_library.cpp b/src/common/dynamic_library.cpp
+index 9bf2c94..f5052ad 100644
+--- a/src/common/dynamic_library.cpp
++++ b/src/common/dynamic_library.cpp
+@@ -18,6 +18,14 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#elif defined(__SWITCH2__)
++#include <cstring>
++// Horizon no tiene cargador dinámico: OunceVK se enlaza estático (-lvulkan) y aquí solo
++// exponemos su punto de entrada. Eden carga el resto de funciones con vkGetInstanceProcAddr.
++extern "C" void* vkGetInstanceProcAddr(void* instance, const char* name);
++namespace {
++char g_static_vulkan_handle;
++}
+ #else
+ #include <dlfcn.h>
+ #endif
+@@ -85,6 +93,8 @@ std::string DynamicLibrary::GetVersionedFilename(const char* libname, int major,
+ bool DynamicLibrary::Open(const char* filename) {
+ #ifdef _WIN32
+     handle = reinterpret_cast<void*>(LoadLibraryA(filename));
++#elif defined(__SWITCH2__)
++    handle = (filename && std::strstr(filename, "vulkan")) ? &g_static_vulkan_handle : nullptr;
+ #else
+     handle = dlopen(filename, RTLD_NOW);
+ #endif
+@@ -97,6 +107,8 @@ void DynamicLibrary::Close() {
+ 
+ #ifdef _WIN32
+     FreeLibrary(reinterpret_cast<HMODULE>(handle));
++#elif defined(__SWITCH2__)
++    // Nada que descargar.
+ #else
+     dlclose(handle);
+ #endif
+@@ -106,6 +118,11 @@ void DynamicLibrary::Close() {
+ void* DynamicLibrary::GetSymbolAddress(const char* name) const {
+ #ifdef _WIN32
+     return reinterpret_cast<void*>(GetProcAddress(reinterpret_cast<HMODULE>(handle), name));
++#elif defined(__SWITCH2__)
++    if (handle == &g_static_vulkan_handle && std::strcmp(name, "vkGetInstanceProcAddr") == 0) {
++        return reinterpret_cast<void*>(&vkGetInstanceProcAddr);
++    }
++    return nullptr;
+ #else
+     return reinterpret_cast<void*>(dlsym(handle, name));
+ #endif
+diff --git a/src/common/fs/file.cpp b/src/common/fs/file.cpp
+index 9e9016e..b4754a3 100644
+--- a/src/common/fs/file.cpp
++++ b/src/common/fs/file.cpp
+@@ -21,6 +21,10 @@
+ #include <io.h>
+ #include <share.h>
+ #include <windows.h>
++#elif defined(__SWITCH2__)
++// Horizon (libounce): sin mmap; los archivos se leen con stdio.
++#include <unistd.h>
++#include <sys/stat.h>
+ #else
+ #include <unistd.h>
+ #include <sys/mman.h>
+@@ -251,7 +255,7 @@ FileType IOFile::GetType() const {
+     return file_type;
+ }
+ 
+-#if defined(__unix__)
++#if defined(__unix__) && !defined(__SWITCH2__)
+ static int PlatformMapReadOnly(IOFile& io, const char* path) {
+     io.mmap_fd = open(path, O_RDONLY);
+     if (io.mmap_fd > 0) {
+@@ -318,7 +322,7 @@ static void PlatformUnmap(IOFile& io) {
+         io.mmap_fd = -1;
+     }
+ }
+-#elif defined(__APPLE__)
++#elif defined(__APPLE__) || defined(__SWITCH2__)
+ // NO IMPLEMENTATION YET
+ #else
+ static int PlatformMapReadOnly(IOFile& io, const wchar_t* path) {
+@@ -392,7 +396,7 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
+     } else {
+         file = std::fopen(path.c_str(), AccessModeToStr(mode, type));
+     }
+-#elif defined(__HAIKU__) || defined(__managarm__) || defined(__OPENORBIS__) || defined(__APPLE__)
++#elif defined(__HAIKU__) || defined(__managarm__) || defined(__OPENORBIS__) || defined(__APPLE__) || defined(__SWITCH2__)
+     file = std::fopen(path.c_str(), AccessModeToStr(mode, type));
+ #elif defined(__unix__)
+     if (type == FileType::BinaryFile && mode == FileAccessMode::Read) {
+@@ -415,7 +419,7 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
+ }
+ 
+ void IOFile::Close() {
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__SWITCH2__)
+     // NO IMPLEMENTATION YET
+ #else
+     PlatformUnmap(*this);
+diff --git a/src/common/fs/path_util.cpp b/src/common/fs/path_util.cpp
+index f040e84..daf5e7a 100644
+--- a/src/common/fs/path_util.cpp
++++ b/src/common/fs/path_util.cpp
+@@ -23,7 +23,9 @@
+ #include <shlobj.h> // Used in GetExeDirectory()
+ #else
+ #include <cstdlib>     // Used in Get(Home/Data)Directory()
++#ifndef __SWITCH2__
+ #include <pwd.h>       // Used in GetHomeDirectory()
++#endif
+ #include <sys/types.h> // Used in GetHomeDirectory()
+ #include <unistd.h>    // Used in GetDataDirectory()
+ #endif
+@@ -127,6 +129,11 @@ public:
+         LEGACY_PATH(Yuzu, YUZU)
+         LEGACY_PATH(Suyu, SUYU)
+ #undef LEGACY_PATH
++#elif defined(__SWITCH2__)
++        // En la consola todo vive en la SD: keys, nand, sdmc, caché de shaders y config.
++        eden_path = fs::path{"sdmc:/switch/eden"};
++        eden_path_cache = eden_path / CACHE_DIR;
++        eden_path_config = eden_path / CONFIG_DIR;
+ #elif __ANDROID__
+         ASSERT(!eden_path.empty());
+         eden_path_cache = eden_path / CACHE_DIR;
+@@ -349,6 +356,9 @@ fs::path GetAppDataRoamingDirectory() {
+ #else
+ 
+ fs::path GetHomeDirectory() {
++#ifdef __SWITCH2__
++    return fs::path{"sdmc:/"};
++#else
+     const char* home_env_var = getenv("HOME");
+ 
+     if (home_env_var) {
+@@ -367,6 +377,7 @@ fs::path GetHomeDirectory() {
+     }
+ 
+     return fs::path{pw->pw_dir};
++#endif
+ }
+ 
+ fs::path GetDataDirectory(const std::string& env_name) {
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index 75a9da8..b917d14 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -12,7 +12,12 @@
+ #include <windows.h>
+ #include "common/dynamic_library.h"
+ 
+-#else // ^^^ Windows ^^^ vvv POSIX vvv
++#elif defined(__SWITCH2__) // ^^^ Windows ^^^ vvv Switch 2 (libounce) vvv
++
++// Horizon no tiene mmap ni memfd: sin fastmem, la RAM del invitado es un bloque del heap.
++#include <cstdlib>
++
++#else // ^^^ Switch 2 ^^^ vvv POSIX vvv
+ 
+ #ifndef _GNU_SOURCE
+ #define _GNU_SOURCE
+@@ -401,7 +406,7 @@ private:
+     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
+ };
+ 
+-#elif defined(__OPENORBIS__) || defined(__managarm__)
++#elif defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__)
+ // None of the luxuries of POSIX, all of the suffering
+ // For managarm: see https://github.com/managarm/managarm/issues/1370
+ #else // ^^^ Windows ^^^ vvv POSIX vvv
+@@ -708,9 +713,15 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+     : backing_size(backing_size_)
+     , virtual_size(virtual_size_)
+ {
+-#if defined(__OPENORBIS__) || defined(__managarm__)
++#if defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__)
+     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
++#ifdef __SWITCH2__
++    // La memoria viene del heap de libounce (el pool de aplicación del juego anfitrión).
++    backing_base = static_cast<u8*>(std::aligned_alloc(PageAlignment, AlignUp(backing_size, PageAlignment)));
++    ASSERT_MSG(backing_base != nullptr, "No hay memoria para {} bytes de DRAM emulada", backing_size);
++#else
+     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++#endif
+     virtual_base = nullptr;
+ #else
+     // Try to allocate a fastmem arena.
+@@ -734,7 +745,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
+ }
+ 
+ HostMemory::~HostMemory() {
+-#ifdef _WIN32
++#if defined(__SWITCH2__)
++    std::free(backing_base);
++#elif defined(_WIN32)
+     if (fallback_buffer) {
+         VirtualFree(backing_base, backing_size, MEM_RELEASE);
+     }
+@@ -750,7 +763,7 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
+ HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+ 
+ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(host_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+@@ -764,7 +777,7 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
+ }
+ 
+ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+@@ -776,7 +789,7 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
+ }
+ 
+ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__))
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+     ASSERT(virtual_offset + length <= virtual_size);
+@@ -795,7 +808,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
+ }
+ 
+ void HostMemory::EnableDirectMappedAddress() {
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__))
+     if (impl) {
+         impl->EnableDirectMappedAddress();
+         virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
+diff --git a/src/common/host_memory.h b/src/common/host_memory.h
+index a7fd053..db06e04 100644
+--- a/src/common/host_memory.h
++++ b/src/common/host_memory.h
+@@ -76,7 +76,7 @@ private:
+     size_t backing_size{};
+     size_t virtual_size{};
+ 
+-#if !(defined(__OPENORBIS__) || defined(__managarm__))
++#if !(defined(__OPENORBIS__) || defined(__managarm__) || defined(__SWITCH2__))
+     // Low level handler for the platform dependent memory routines
+     class Impl;
+     std::unique_ptr<Impl> impl;
+diff --git a/src/common/memory_detect.cpp b/src/common/memory_detect.cpp
+index 86a3abc..2de08bd 100644
+--- a/src/common/memory_detect.cpp
++++ b/src/common/memory_detect.cpp
+@@ -12,6 +12,8 @@
+ #include <sys/sysctl.h>
+ #elif defined(__linux__)
+ #include <sys/sysinfo.h>
++#elif defined(__SWITCH2__)
++#include <switch.h>
+ #else
+ #include <unistd.h>
+ #endif
+@@ -56,6 +58,12 @@ static MemoryInfo Detect() {
+     sysinfo(&meminfo);
+     mem_info.TotalPhysicalMemory = meminfo.totalram;
+     mem_info.TotalSwapMemory = meminfo.totalswap;
++#elif defined(__SWITCH2__)
++    // Memoria que el kernel concede a este proceso (el pool del juego anfitrión).
++    u64 total = 0;
++    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    mem_info.TotalPhysicalMemory = total;
++    mem_info.TotalSwapMemory = 0;
+ #else
+     mem_info.TotalPhysicalMemory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+     mem_info.TotalSwapMemory = 0;
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+index 28c731f..0f7ced8 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
+@@ -190,7 +190,11 @@ void ArmDynarmic32::MakeJit(Common::PageTable* page_table) {
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__SWITCH2__)
++    // Cada caché ocupa su tamaño en memoria bloqueada + otro tanto de staging (kaiHEN),
++    // y hay un JIT por núcleo emulado: 4 x 64 MiB x 2 = 512 MiB.
++    config.code_cache_size = std::uint32_t(64_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index b4d18d3..f91577e 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -244,7 +244,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
+     config.enable_cycle_counting = !m_uses_wall_clock;
+ 
+     // Code cache size
+-#if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
++#if defined(__SWITCH2__)
++    // Cada caché ocupa su tamaño en memoria bloqueada + otro tanto de staging (kaiHEN),
++    // y hay un JIT por núcleo emulado: 4 x 64 MiB x 2 = 512 MiB.
++    config.code_cache_size = std::uint32_t(64_MiB);
++#elif defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+     config.code_cache_size = std::uint32_t(128_MiB);
+ #else
+     config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
+index ee7a769..2515a51 100644
+--- a/src/core/frontend/emu_window.h
++++ b/src/core/frontend/emu_window.h
+@@ -26,6 +26,7 @@ enum class WindowSystemType {
+     Cocoa,
+     Android,
+     Xcb,
++    NintendoSwitch, ///< render_surface es un NWindow* de libounce (VK_NN_vi_surface)
+ };
+ 
+ /**
+diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
+index 72cc05e..ced7db8 100644
+--- a/src/dynarmic/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/src/dynarmic/CMakeLists.txt
+@@ -321,6 +321,13 @@ if (ARCHITECTURE_loongarch64)
+     message(WARNING "TODO: Incomplete frontend for this host architecture")
+ endif()
+ 
++if (NINTENDO_SWITCH2)
++    # JIT de kaiHEN (staging RW + RX publicada por RO). Ver horizon_code_block.h.
++    target_sources(dynarmic PRIVATE
++        backend/arm64/horizon_code_block.cpp
++        backend/arm64/horizon_code_block.h)
++endif()
++
+ if (WIN32)
+     target_sources(dynarmic PRIVATE backend/exception_handler_windows.cpp)
+ elseif (APPLE)
+@@ -361,7 +368,7 @@ elseif (APPLE)
+             backend/exception_handler_macos_mig.c
+         )
+     endif()
+-elseif (UNIX AND NOT HAIKUOS)
++elseif (UNIX AND NOT HAIKUOS AND NOT NINTENDO_SWITCH)
+     # Haiku lacks <ucontext.h>
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         target_link_libraries(dynarmic PRIVATE rt)
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
+index f06274a..f1a6f06 100644
+--- a/src/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -387,7 +387,12 @@ void A32AddressSpace::EmitPrelude() {
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
++#ifdef __SWITCH2__
++    // Publicar solo el preludio recién emitido, no los 64 MiB del caché.
++    mem.invalidate(mem.xptr(), static_cast<std::size_t>(code.xptr<std::uint8_t*>() - reinterpret_cast<std::uint8_t*>(mem.xptr())));
++#else
+     mem.invalidate_all();
++#endif
+     ProtectCodeMemory();
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
+index ff7f1b3..c4a92b4 100644
+--- a/src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -558,7 +558,12 @@ void A64AddressSpace::EmitPrelude() {
+ 
+     prelude_info.end_of_prelude = code.offset();
+ 
++#ifdef __SWITCH2__
++    // Publicar solo el preludio recién emitido, no los 64 MiB del caché.
++    mem.invalidate(mem.xptr(), static_cast<std::size_t>(code.xptr<std::uint8_t*>() - reinterpret_cast<std::uint8_t*>(mem.xptr())));
++#else
+     mem.invalidate_all();
++#endif
+     ProtectCodeMemory();
+ }
+ 
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/src/dynarmic/backend/arm64/address_space.cpp
+index cab0ce4..62e0a39 100644
+--- a/src/dynarmic/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/src/dynarmic/backend/arm64/address_space.cpp
+@@ -29,12 +29,19 @@ AddressSpace::AddressSpace(std::size_t code_cache_size)
+     : ir_block{IR::LocationDescriptor{0}}
+     , code_cache_size(code_cache_size)
+     , mem(code_cache_size)
++#ifdef __SWITCH2__
++    , code(mem.wptr(), mem.xptr())
++#else
+     , code(mem.ptr(), mem.ptr())
++#endif
+     , fastmem_manager(exception_handler)
+ {
+     ASSERT(code_cache_size <= 128 * 1024 * 1024 && "code_cache_size > 128 MiB not currently supported");
+ 
++#ifndef __SWITCH2__
++    // Sin señales en Horizon: no hay fastmem y el handler genérico no registra nada.
+     exception_handler.Register(mem, code_cache_size);
++#endif
+     exception_handler.SetFastmemCallback([this](u64 host_pc) {
+         return FastmemCallback(host_pc);
+     });
+@@ -144,7 +151,11 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, target] : block_info.relocations) {
++#ifdef __SWITCH2__
++        CodeGenerator c{mem.wptr(), mem.xptr()};
++#else
+         CodeGenerator c{mem.ptr(), mem.ptr()};
++#endif
+         c.set_xptr(reinterpret_cast<u32*>(block_info.entry_point + ptr_offset));
+ 
+         switch (target) {
+@@ -290,7 +301,11 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+     using namespace oaknut::util;
+ 
+     for (auto [ptr_offset, type] : block_relocations_list) {
++#ifdef __SWITCH2__
++        CodeGenerator c{mem.wptr(), mem.xptr()};
++#else
+         CodeGenerator c{mem.ptr(), mem.ptr()};
++#endif
+         c.set_xptr(reinterpret_cast<u32*>(entry_point + ptr_offset));
+ 
+         switch (type) {
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/src/dynarmic/backend/arm64/address_space.h
+index 755b05b..0af6999 100644
+--- a/src/dynarmic/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/src/dynarmic/backend/arm64/address_space.h
+@@ -12,7 +12,11 @@
+ #include <optional>
+ 
+ #include "common/common_types.h"
+-#include <oaknut/code_block.hpp>
++#ifdef __SWITCH2__
++#    include "dynarmic/backend/arm64/horizon_code_block.h"
++#else
++#    include <oaknut/code_block.hpp>
++#endif
+ #include <oaknut/oaknut.hpp>
+ #include "common/container/unordered_map.h"
+ #include "common/container/unordered_set.h"
+@@ -50,13 +54,13 @@ protected:
+     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+ 
+     void ProtectCodeMemory() {
+-#if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__)
++#if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__SWITCH2__)
+         mem.protect();
+ #endif
+     }
+ 
+     void UnprotectCodeMemory() {
+-#if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__)
++#if defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT) || defined(__APPLE__) || defined(__OpenBSD__) || defined(__SWITCH2__)
+         mem.unprotect();
+ #endif
+     }
+@@ -71,7 +75,12 @@ protected:
+ 
+     IR::Block ir_block;
+     const std::size_t code_cache_size;
++#ifdef __SWITCH2__
++    // Staging RW + vista RX separadas; ver horizon_code_block.h.
++    HorizonCodeBlock mem;
++#else
+     oaknut::CodeBlock mem;
++#endif
+     oaknut::CodeGenerator code;
+ 
+     // A IR::LocationDescriptor will have one current CodePtr.
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
+new file mode 100644
+index 0000000..d33116b
+--- /dev/null
++++ b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
+@@ -0,0 +1,74 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Único archivo de Dynarmic que incluye libounce/kaiHEN. Ver horizon_code_block.h.
++
++#include "dynarmic/backend/arm64/horizon_code_block.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <new>
++
++#include <switch.h>
++#include <kaihen.h>
++
++namespace Dynarmic::Backend::Arm64 {
++
++static_assert(sizeof(HorizonCodeBlock::Range) == sizeof(KaihenJitRange));
++static_assert(offsetof(HorizonCodeBlock::Range, offset) == offsetof(KaihenJitRange, offset));
++static_assert(offsetof(HorizonCodeBlock::Range, size) == offsetof(KaihenJitRange, size));
++
++struct HorizonCodeBlock::Impl {
++    Jit jit{};
++};
++
++HorizonCodeBlock::HorizonCodeBlock(std::size_t size)
++        : m_impl{std::make_unique<Impl>()}, m_size{size} {
++    if (R_FAILED(jitCreate(&m_impl->jit, size))) {
++        throw std::bad_alloc{};
++    }
++    m_w = static_cast<std::uint32_t*>(jitGetRwAddr(&m_impl->jit));
++    m_x = static_cast<std::uint32_t*>(jitGetRxAddr(&m_impl->jit));
++    m_dirty.reserve(64);
++}
++
++HorizonCodeBlock::~HorizonCodeBlock() {
++    jitClose(&m_impl->jit);
++}
++
++void HorizonCodeBlock::invalidate_all() {
++    m_dirty.clear();
++    m_dirty.push_back(Range{0, m_size});
++    Publish();
++}
++
++void HorizonCodeBlock::Publish() {
++    if (m_dirty.empty()) {
++        return;
++    }
++    // kaiHEN funde rangos adyacentes, pero ordenar y unir solapes aquí reduce
++    // los bytes por IPC cuando un mismo bloque se re-enlaza varias veces.
++    std::sort(m_dirty.begin(), m_dirty.end(),
++              [](const Range& a, const Range& b) { return a.offset < b.offset; });
++    std::size_t out = 0;
++    for (std::size_t i = 1; i < m_dirty.size(); ++i) {
++        Range& last = m_dirty[out];
++        const Range& cur = m_dirty[i];
++        if (cur.offset <= last.offset + last.size) {
++            last.size = std::max(last.offset + last.size, cur.offset + cur.size) - last.offset;
++        } else {
++            m_dirty[++out] = cur;
++        }
++    }
++    m_dirty.resize(out + 1);
++
++    const Result rc = kaihenJitPublishRanges(
++        &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
++    if (R_FAILED(rc)) {
++        // Sin publicación el invitado ejecutaría código viejo: mejor abortar ya.
++        diagAbortWithResult(rc);
++    }
++    m_dirty.clear();
++}
++
++}  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.h b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.h
+new file mode 100644
+index 0000000..5ca14c5
+--- /dev/null
++++ b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.h
+@@ -0,0 +1,87 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Bloque de código JIT para Switch 2 (libounce + kaiHEN).
++//
++// En Horizon un juego no puede mapear memoria RWX ni llamar a las syscalls de
++// code memory. kaiHEN resuelve el JIT con el proceso RO: jitCreate() devuelve
++// una vista RX estable (la que se ejecuta) y un búfer de staging RW que NO es
++// un alias físico de la RX. Lo escrito en staging solo se vuelve ejecutable al
++// publicarlo (kaihenJitPublishRanges), que copia los rangos a través del alias
++// que retiene RO, limpia la caché de datos e invalida la caché de
++// instrucciones del hilo que llama.
++//
++// Esta clase imita la interfaz de oaknut::CodeBlock que usa el backend arm64
++// de Dynarmic, separando wptr() (staging) de xptr() (RX):
++//   - invalidate(x, n) no toca cachés: anota el rango como sucio.
++//   - protect() publica todos los rangos sucios en una sola petición IPC.
++//   - unprotect() no hace nada: el staging siempre es escribible.
++//
++// Cada AddressSpace pertenece a un núcleo emulado y solo su propio hilo emite
++// y parchea código, así que nunca se modifica un bloque que otro hilo esté
++// ejecutando (requisito de kaiHEN).
++//
++// IMPORTANTE: este header NO incluye <switch.h>. libnx define macros (BIT, ...)
++// y tipos globales (u128, ...) que chocan con oaknut y Dynarmic; todo lo de
++// libounce vive en horizon_code_block.cpp.
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++namespace Dynarmic::Backend::Arm64 {
++
++class HorizonCodeBlock {
++public:
++    explicit HorizonCodeBlock(std::size_t size);
++    ~HorizonCodeBlock();
++
++    HorizonCodeBlock(const HorizonCodeBlock&) = delete;
++    HorizonCodeBlock& operator=(const HorizonCodeBlock&) = delete;
++    HorizonCodeBlock(HorizonCodeBlock&&) = delete;
++    HorizonCodeBlock& operator=(HorizonCodeBlock&&) = delete;
++
++    /// Dirección ejecutable (la que Dynarmic usa como CodePtr).
++    std::uint32_t* xptr() const { return m_x; }
++    /// Dirección escribible (staging).
++    std::uint32_t* wptr() const { return m_w; }
++    /// Compatibilidad con oaknut::CodeBlock::ptr(): devuelve la vista RX.
++    std::uint32_t* ptr() const { return m_x; }
++
++    void unprotect() {}
++    void protect() { Publish(); }
++
++    /// Marca como sucio [xmem, xmem + size) (direcciones de la vista RX).
++    void invalidate(std::uint32_t* xmem, std::size_t size) {
++        const auto begin = reinterpret_cast<std::uintptr_t>(xmem);
++        const auto base = reinterpret_cast<std::uintptr_t>(m_x);
++        if (size == 0 || begin < base || begin + size > base + m_size) {
++            return;
++        }
++        m_dirty.push_back(Range{begin - base, size});
++    }
++
++    /// Publica el búfer completo. Caro (copia m_size bytes): evitarlo en caliente.
++    void invalidate_all();
++
++    /// Mismo layout que KaihenJitRange (comprobado con static_assert en el .cpp).
++    struct Range {
++        std::uint64_t offset;
++        std::uint64_t size;
++    };
++
++private:
++    void Publish();
++
++    struct Impl;
++    std::unique_ptr<Impl> m_impl;
++    std::size_t m_size;
++    std::uint32_t* m_w = nullptr;
++    std::uint32_t* m_x = nullptr;
++    std::vector<Range> m_dirty;
++};
++
++}  // namespace Dynarmic::Backend::Arm64
+diff --git a/src/dynarmic/src/dynarmic/common/spin_lock_arm64.cpp b/src/dynarmic/src/dynarmic/common/spin_lock_arm64.cpp
+index 7833b65..d63cf87 100644
+--- a/src/dynarmic/src/dynarmic/common/spin_lock_arm64.cpp
++++ b/src/dynarmic/src/dynarmic/common/spin_lock_arm64.cpp
+@@ -5,7 +5,9 @@
+ 
+ #include <mutex>
+ 
++#ifndef __SWITCH2__
+ #include <oaknut/code_block.hpp>
++#endif
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/abi.h"
+@@ -35,6 +37,28 @@ void EmitSpinLockUnlock(oaknut::CodeGenerator& code, oaknut::XReg ptr) {
+     code.STLR(WZR, ptr);
+ }
+ 
++#ifdef __SWITCH2__
++
++// En Switch 2 no generamos el spinlock con JIT: un objeto estático no puede pedir
++// memoria a kaiHEN antes de que libounce haya inicializado sus servicios. Mismo
++// protocolo que el código emitido (0 = libre, 1 = tomado; adquirir/liberar).
++void SpinLock::Lock() noexcept {
++    for (;;) {
++        if (__atomic_exchange_n(&storage, 1, __ATOMIC_ACQUIRE) == 0) {
++            return;
++        }
++        while (__atomic_load_n(&storage, __ATOMIC_RELAXED) != 0) {
++            __asm__ volatile("yield");
++        }
++    }
++}
++
++void SpinLock::Unlock() noexcept {
++    __atomic_store_n(&storage, 0, __ATOMIC_RELEASE);
++}
++
++#else
++
+ namespace {
+ 
+ struct SpinLockImpl {
+@@ -83,4 +107,6 @@ void SpinLock::Unlock() noexcept {
+     impl.unlock(&storage);
+ }
+ 
++#endif  // __SWITCH2__
++
+ }  // namespace Dynarmic
+diff --git a/src/eden_ounce/CMakeLists.txt b/src/eden_ounce/CMakeLists.txt
+new file mode 100644
+index 0000000..f70c16b
+--- /dev/null
++++ b/src/eden_ounce/CMakeLists.txt
+@@ -0,0 +1,42 @@
++# SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++# SPDX-License-Identifier: GPL-3.0-or-later
++
++# Frontend nativo de Eden para Switch 2. Solo se configura con el toolchain de
++# ounce-devkit (Switch2.cmake), que define NINTENDO_SWITCH2 y __SWITCH2__.
++
++add_executable(eden-ounce
++    # Lado Eden (sin <switch.h>)
++    emu_window_ounce.cpp
++    emu_window_ounce.h
++    main.cpp
++    pad_input.cpp
++    pad_input.h
++    # Lado Horizon (solo <switch.h>, sin headers de Eden; ver horizon.h)
++    horizon.cpp
++    horizon.h
++    launcher.cpp
++)
++
++target_include_directories(eden-ounce PRIVATE ${PROJECT_SOURCE_DIR}/src)
++
++target_link_libraries(eden-ounce PRIVATE
++    common core input_common frontend_common video_core audio_core
++    Threads::Threads
++)
++target_link_libraries(eden-ounce PRIVATE OpenSSL::SSL OpenSSL::Crypto)
++
++# OunceVK (Vulkan) va estático: dynamic_library.cpp expone su vkGetInstanceProcAddr.
++# libkaihen aporta el proveedor del JIT (kaihen-jit.o) que usan jitCreate/
++# kaihenJitPublishRanges; debe ir antes de libounce (-lnx) en la línea de enlace.
++target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
++
++nx_generate_nacp(eden-ounce.nacp
++    NAME    "Eden"
++    AUTHOR  "Eden Emulator Project (port Ounce)"
++    VERSION "0.0.1-ounce"
++)
++
++nx_create_nro(eden-ounce
++    OUTPUT ${CMAKE_BINARY_DIR}/eden.nro
++    NACP   eden-ounce.nacp   # icono por defecto de libounce
++)
+diff --git a/src/eden_ounce/emu_window_ounce.cpp b/src/eden_ounce/emu_window_ounce.cpp
+new file mode 100644
+index 0000000..32f2c0a
+--- /dev/null
++++ b/src/eden_ounce/emu_window_ounce.cpp
+@@ -0,0 +1,91 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Sin <switch.h>: todo lo de la consola pasa por horizon.h.
++
++#include "common/logging.h"
++#include "common/settings.h"
++#include "core/core.h"
++#include "core/frontend/framebuffer_layout.h"
++#include "core/frontend/graphics_context.h"
++#include "core/hle/service/am/applet_manager.h"
++#include "eden_ounce/emu_window_ounce.h"
++#include "eden_ounce/horizon.h"
++#include "eden_ounce/pad_input.h"
++#include "input_common/main.h"
++
++namespace EdenOunce {
++namespace {
++
++// Vulkan no necesita contexto compartido; Eden solo pide uno "vacío".
++class DummyContext final : public Core::Frontend::GraphicsContext {};
++
++} // namespace
++
++EmuWindowOunce::EmuWindowOunce(InputCommon::InputSubsystem& input_subsystem_, Core::System& system_)
++    : input_subsystem{input_subsystem_}, system{system_} {
++    input_subsystem.Initialize();
++    InitializePads();
++
++    window_info.type = Core::Frontend::WindowSystemType::NintendoSwitch;
++    window_info.render_surface = Ounce::Hos::DefaultWindow();
++    window_info.render_surface_scale = 1.0f;
++
++    last_docked = Ounce::Hos::IsDocked();
++    UpdateLayout();
++    LOG_INFO(Frontend, "Ventana Ounce lista: {}x{} ({})", width, height,
++             last_docked ? "dock" : "portatil");
++}
++
++EmuWindowOunce::~EmuWindowOunce() {
++    input_subsystem.Shutdown();
++}
++
++std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindowOunce::CreateSharedContext() const {
++    return std::make_unique<DummyContext>();
++}
++
++bool EmuWindowOunce::IsShown() const {
++    return Ounce::Hos::IsInFocus();
++}
++
++void EmuWindowOunce::UpdateLayout() {
++    u32 w = 0;
++    u32 h = 0;
++    if (!Ounce::Hos::GetWindowSize(w, h)) {
++        w = last_docked ? Layout::ScreenDocked::Width : Layout::ScreenUndocked::Width;
++        h = last_docked ? Layout::ScreenDocked::Height : Layout::ScreenUndocked::Height;
++    }
++    width = w;
++    height = h;
++    UpdateCurrentFramebufferLayout(width, height);
++}
++
++bool EmuWindowOunce::PumpEvents() {
++    if (!Ounce::Hos::MainLoop()) {
++        open = false;
++        return false;
++    }
++
++    if (PollPads(input_subsystem)) {
++        LOG_INFO(Frontend, "Atajo de salida (+ y -) detectado");
++        open = false;
++        return false;
++    }
++
++    const bool docked = Ounce::Hos::IsDocked();
++    if (docked != last_docked) {
++        last_docked = docked;
++        // El juego emulado también cambia de modo, como en una consola real.
++        Settings::values.use_docked_mode.SetValue(docked ? Settings::ConsoleMode::Docked
++                                                         : Settings::ConsoleMode::Handheld);
++        if (system.IsPoweredOn()) {
++            system.GetAppletManager().OperationModeChanged();
++        }
++        UpdateLayout();
++        LOG_INFO(Frontend, "Modo cambiado a {}", docked ? "dock" : "portatil");
++    }
++    return open;
++}
++
++} // namespace EdenOunce
+diff --git a/src/eden_ounce/emu_window_ounce.h b/src/eden_ounce/emu_window_ounce.h
+new file mode 100644
+index 0000000..656a2da
+--- /dev/null
++++ b/src/eden_ounce/emu_window_ounce.h
+@@ -0,0 +1,49 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <memory>
++
++#include "core/frontend/emu_window.h"
++
++namespace Core {
++class System;
++}
++
++namespace InputCommon {
++class InputSubsystem;
++}
++
++namespace EdenOunce {
++
++/// Ventana de emulación sobre el NWindow por defecto de libounce.
++/// Vulkan (OunceVK) crea la superficie con VK_NN_vi_surface a partir de render_surface.
++class EmuWindowOunce final : public Core::Frontend::EmuWindow {
++public:
++    EmuWindowOunce(InputCommon::InputSubsystem& input_subsystem, Core::System& system);
++    ~EmuWindowOunce() override;
++
++    std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override;
++    bool IsShown() const override;
++
++    /// Bucle principal: entrada, modo dock/portátil y eventos del applet.
++    /// Devuelve false cuando hay que cerrar (HOME > cerrar, o + y - a la vez).
++    bool PumpEvents();
++
++    void RequestClose() { open = false; }
++    bool IsOpen() const { return open; }
++
++private:
++    void UpdateLayout();
++
++    InputCommon::InputSubsystem& input_subsystem;
++    Core::System& system;
++    std::atomic_bool open{true};
++    bool last_docked = false;
++    u32 width = 0;
++    u32 height = 0;
++};
++
++} // namespace EdenOunce
+diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
+new file mode 100644
+index 0000000..5d9c469
+--- /dev/null
++++ b/src/eden_ounce/horizon.cpp
+@@ -0,0 +1,97 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Implementación de horizon.h. Este archivo incluye <switch.h> y NINGÚN header de Eden.
++
++#include <switch.h>
++
++#include "eden_ounce/horizon.h"
++
++namespace Ounce::Hos {
++
++static_assert(Button::A == HidNpadButton_A && Button::B == HidNpadButton_B);
++static_assert(Button::X == HidNpadButton_X && Button::Y == HidNpadButton_Y);
++static_assert(Button::StickL == HidNpadButton_StickL && Button::StickR == HidNpadButton_StickR);
++static_assert(Button::L == HidNpadButton_L && Button::R == HidNpadButton_R);
++static_assert(Button::ZL == HidNpadButton_ZL && Button::ZR == HidNpadButton_ZR);
++static_assert(Button::Plus == HidNpadButton_Plus && Button::Minus == HidNpadButton_Minus);
++static_assert(Button::Left == HidNpadButton_Left && Button::Up == HidNpadButton_Up);
++static_assert(Button::Right == HidNpadButton_Right && Button::Down == HidNpadButton_Down);
++static_assert(Button::AnySL == HidNpadButton_AnySL && Button::AnySR == HidNpadButton_AnySR);
++
++void SetNoSuspend() {
++    appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
++}
++
++bool MainLoop() {
++    return appletMainLoop();
++}
++
++bool IsDocked() {
++    return appletGetOperationMode() == AppletOperationMode_Console;
++}
++
++bool IsInFocus() {
++    return appletGetFocusState() == AppletFocusState_InFocus;
++}
++
++void SleepNs(std::int64_t ns) {
++    svcSleepThread(ns);
++}
++
++std::uint64_t MonotonicNs() {
++    return armTicksToNs(armGetSystemTick());
++}
++
++void* DefaultWindow() {
++    return nwindowGetDefault();
++}
++
++bool GetWindowSize(std::uint32_t& width, std::uint32_t& height) {
++    u32 w = 0;
++    u32 h = 0;
++    if (R_FAILED(nwindowGetDimensions(nwindowGetDefault(), &w, &h)) || w == 0 || h == 0) {
++        return false;
++    }
++    width = w;
++    height = h;
++    return true;
++}
++
++namespace {
++std::array<PadState, MaxPads> g_pads{};
++
++float Normalize(s32 v) {
++    return static_cast<float>(v) / static_cast<float>(JOYSTICK_MAX);
++}
++} // namespace
++
++void InitPads() {
++    padConfigureInput(MaxPads, HidNpadStyleSet_NpadStandard);
++    // Mando 0 = portátil + jugador 1 (como padInitializeDefault); el resto, uno por jugador.
++    padInitializeDefault(&g_pads[0]);
++    for (int i = 1; i < MaxPads; ++i) {
++        padInitialize(&g_pads[i], static_cast<HidNpadIdType>(HidNpadIdType_No1 + i));
++    }
++}
++
++void PollPads(std::array<PadSnapshot, MaxPads>& out) {
++    for (int i = 0; i < MaxPads; ++i) {
++        PadState& pad = g_pads[i];
++        padUpdate(&pad);
++        PadSnapshot& snap = out[i];
++        snap.connected = padIsConnected(&pad);
++        if (!snap.connected) {
++            continue;
++        }
++        snap.buttons = padGetButtons(&pad);
++        const HidAnalogStickState l = padGetStickPos(&pad, 0);
++        const HidAnalogStickState r = padGetStickPos(&pad, 1);
++        snap.lx = Normalize(l.x);
++        snap.ly = Normalize(l.y);
++        snap.rx = Normalize(r.x);
++        snap.ry = Normalize(r.y);
++    }
++}
++
++} // namespace Ounce::Hos
+diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
+new file mode 100644
+index 0000000..29c37f5
+--- /dev/null
++++ b/src/eden_ounce/horizon.h
+@@ -0,0 +1,64 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Capa de plataforma Horizon (libounce) para el frontend.
++//
++// libnx/libounce y Eden NO pueden compartir una unidad de compilación:
++//   - libnx define `struct Service` y Eden un `namespace Service`;
++//   - ambos definen `u128` con tipos distintos;
++//   - libnx define macros como BIT() que rompen oaknut.
++// Por eso solo horizon.cpp y launcher.cpp incluyen <switch.h>; el resto del
++// frontend (y todo Eden) habla con la consola únicamente a través de este header,
++// que solo usa tipos estándar.
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <string>
++
++namespace Ounce::Hos {
++
++// ------------------------------------------------------------------ applet
++void SetNoSuspend();     ///< Seguir emulando aunque el applet pierda el foco.
++bool MainLoop();         ///< appletMainLoop(): false si el sistema pide cerrar.
++bool IsDocked();         ///< true en modo TV/dock.
++bool IsInFocus();
++void SleepNs(std::int64_t ns);
++std::uint64_t MonotonicNs();
++
++// ------------------------------------------------------------------ vídeo
++void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).
++bool GetWindowSize(std::uint32_t& width, std::uint32_t& height);
++
++// ------------------------------------------------------------------ entrada
++/// Bits de botón con los mismos valores que HidNpadButton (comprobado en horizon.cpp).
++namespace Button {
++constexpr std::uint64_t A = 1ULL << 0, B = 1ULL << 1, X = 1ULL << 2, Y = 1ULL << 3;
++constexpr std::uint64_t StickL = 1ULL << 4, StickR = 1ULL << 5;
++constexpr std::uint64_t L = 1ULL << 6, R = 1ULL << 7, ZL = 1ULL << 8, ZR = 1ULL << 9;
++constexpr std::uint64_t Plus = 1ULL << 10, Minus = 1ULL << 11;
++constexpr std::uint64_t Left = 1ULL << 12, Up = 1ULL << 13, Right = 1ULL << 14, Down = 1ULL << 15;
++constexpr std::uint64_t LeftSL = 1ULL << 24, LeftSR = 1ULL << 25;
++constexpr std::uint64_t RightSL = 1ULL << 26, RightSR = 1ULL << 27;
++constexpr std::uint64_t AnySL = LeftSL | RightSL, AnySR = LeftSR | RightSR;
++} // namespace Button
++
++struct PadSnapshot {
++    bool connected = false;
++    std::uint64_t buttons = 0;
++    float lx = 0, ly = 0, rx = 0, ry = 0; ///< -1..1, Y positivo = arriba
++};
++constexpr int MaxPads = 8;
++
++void InitPads();
++void PollPads(std::array<PadSnapshot, MaxPads>& out);
++
++// ------------------------------------------------------------------ UI de texto (launcher.cpp)
++/// Selector de juegos sobre la consola de libounce. Devuelve "" si el usuario sale.
++/// Libera el NWindow al terminar, para que Vulkan pueda usarlo.
++std::string PickGame(const std::string& games_dir);
++/// Muestra un error a pantalla completa hasta que se pulse +.
++void ShowFatal(const std::string& message);
++
++} // namespace Ounce::Hos
+diff --git a/src/eden_ounce/launcher.cpp b/src/eden_ounce/launcher.cpp
+new file mode 100644
+index 0000000..f883d4e
+--- /dev/null
++++ b/src/eden_ounce/launcher.cpp
+@@ -0,0 +1,116 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Selector de juegos y pantalla de error en modo texto. Incluye <switch.h> y
++// NINGÚN header de Eden (ver horizon.h).
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <filesystem>
++#include <system_error>
++#include <vector>
++
++#include <switch.h>
++
++#include "eden_ounce/horizon.h"
++
++namespace fs = std::filesystem;
++
++namespace Ounce::Hos {
++namespace {
++
++bool HasGameExtension(const fs::path& p) {
++    std::string ext = p.extension().string();
++    std::transform(ext.begin(), ext.end(), ext.begin(),
++                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++    return ext == ".nsp" || ext == ".xci" || ext == ".nca" || ext == ".nro" || ext == ".nso";
++}
++
++std::vector<fs::path> ListGames(const std::string& dir) {
++    std::vector<fs::path> games;
++    std::error_code ec;
++    fs::create_directories(dir, ec);
++    for (const auto& entry : fs::directory_iterator(dir, ec)) {
++        if (entry.is_regular_file(ec) && HasGameExtension(entry.path())) {
++            games.push_back(entry.path());
++        }
++    }
++    std::sort(games.begin(), games.end());
++    return games;
++}
++
++} // namespace
++
++std::string PickGame(const std::string& games_dir) {
++    // La consola usa el NWindow por defecto: hay que cerrarla antes de crear la superficie Vulkan.
++    PrintConsole* console = consoleInit(nullptr);
++    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++    PadState pad;
++    padInitializeDefault(&pad);
++
++    const auto games = ListGames(games_dir);
++    std::size_t selected = 0;
++    std::string result;
++    bool redraw = true;
++
++    while (appletMainLoop()) {
++        padUpdate(&pad);
++        const u64 down = padGetButtonsDown(&pad);
++
++        if (redraw) {
++            consoleClear();
++            std::printf("\x1b[1;1HEden para Switch 2 (eden-ounce) - experimental\n");
++            std::printf("Juegos en %s\n\n", games_dir.c_str());
++            if (games.empty()) {
++                std::printf("No hay juegos. Copia tus dumps (.nsp/.xci/.nca/.nro)\n");
++                std::printf("a esa carpeta y vuelve a abrir Eden.\n");
++            }
++            const std::size_t first = selected > 30 ? selected - 30 : 0;
++            for (std::size_t i = first; i < games.size() && i < first + 36; ++i) {
++                std::printf("%s %s\n", i == selected ? ">" : " ",
++                            games[i].filename().string().c_str());
++            }
++            std::printf("\x1b[44;1HA: iniciar   +: salir");
++            consoleUpdate(console);
++            redraw = false;
++        }
++
++        if (down & HidNpadButton_Plus) {
++            break;
++        }
++        if (!games.empty()) {
++            if (down & HidNpadButton_AnyDown) {
++                selected = (selected + 1) % games.size();
++                redraw = true;
++            } else if (down & HidNpadButton_AnyUp) {
++                selected = (selected + games.size() - 1) % games.size();
++                redraw = true;
++            } else if (down & HidNpadButton_A) {
++                result = games[selected].string();
++                break;
++            }
++        }
++    }
++    consoleExit(console);
++    return result;
++}
++
++void ShowFatal(const std::string& message) {
++    PrintConsole* console = consoleInit(nullptr);
++    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++    PadState pad;
++    padInitializeDefault(&pad);
++    std::printf("\x1b[1;1HEden no pudo arrancar:\n\n%s\n\nPulsa + para salir.", message.c_str());
++    consoleUpdate(console);
++    while (appletMainLoop()) {
++        padUpdate(&pad);
++        if (padGetButtonsDown(&pad) & HidNpadButton_Plus) {
++            break;
++        }
++        svcSleepThread(16'000'000);
++    }
++    consoleExit(console);
++}
++
++} // namespace Ounce::Hos
+diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
+new file mode 100644
+index 0000000..f425361
+--- /dev/null
++++ b/src/eden_ounce/main.cpp
+@@ -0,0 +1,172 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// eden-ounce: frontend nativo de Eden para Switch 2 (KaiHEN + libounce).
++//
++// Arranque:
++//   1. hbloader lanza eden.nro (con o sin una ruta en argv[1]).
++//   2. Si no hay ruta, un selector de texto lista sdmc:/switch/eden/games.
++//   3. Se configura Eden para esta plataforma (Dynarmic sin fastmem, Vulkan/OunceVK,
++//      4 GiB de DRAM emulada) y se lanza el juego.
++//
++// Lo que el usuario necesita en la SD (dumpeado de SU consola, Eden no lo trae):
++//   sdmc:/switch/eden/keys/prod.keys  (+ title.keys para juegos con ticket)
++//   sdmc:/switch/eden/nand/system/... (firmware dumpeado, opcional pero recomendado)
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <system_error>
++#include <vector>
++
++#include "common/fs/fs.h"
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "core/core.h"
++#include "core/cpu_manager.h"
++#include "core/file_sys/registered_cache.h"
++#include "core/file_sys/vfs/vfs_real.h"
++#include "core/hle/service/am/applet_manager.h"
++#include "core/hle/service/filesystem/filesystem.h"
++#include "core/loader/loader.h"
++#include "eden_ounce/emu_window_ounce.h"
++#include "eden_ounce/horizon.h"
++#include "input_common/main.h"
++#include "video_core/gpu.h"
++#include "video_core/rasterizer_interface.h"
++#include "video_core/renderer_base.h"
++
++namespace fs = std::filesystem;
++
++namespace {
++
++constexpr const char* kGamesDir = "sdmc:/switch/eden/games";
++
++/// Valores por defecto para esta plataforma. Se aplican antes de Initialize().
++void ConfigureForSwitch2() {
++    using namespace Settings;
++    // Sin NCE: kaiHEN no deja mapear el código del invitado como ejecutable en
++    // direcciones propias. Dynarmic recompila a la caché JIT de kaiHEN.
++    values.cpu_backend.SetValue(CpuBackend::Dynarmic);
++    // Sin mmap/aliasing no hay fastmem: Dynarmic usa la tabla de páginas.
++    values.cpuopt_fastmem.SetValue(false);
++    values.cpuopt_fastmem_exclusives.SetValue(false);
++    values.use_multi_core.SetValue(true);
++    // 4 GiB como la Switch 1; el pool de un juego de Switch 2 no da para más con Eden encima.
++    values.memory_layout_mode.SetValue(MemoryLayout::Memory_4Gb);
++
++    values.renderer_backend.SetValue(RendererBackend::Vulkan);
++    values.vsync_mode.SetValue(VSyncMode::Fifo);
++    values.resolution_setup.SetValue(ResolutionSetup::Res1X);
++    values.use_disk_shader_cache.SetValue(true);
++    values.use_asynchronous_gpu_emulation.SetValue(true);
++    // NVDEC por CPU necesita FFmpeg; desactivado hasta portarlo (los vídeos salen en negro).
++    values.nvdec_emulation.SetValue(NvdecEmulation::Off);
++    // Fase 1: sin backend de audio nativo todavía.
++    values.sink_id.SetValue(AudioEngine::Null);
++
++    values.use_docked_mode.SetValue(Ounce::Hos::IsDocked() ? ConsoleMode::Docked
++                                                           : ConsoleMode::Handheld);
++}
++
++bool CheckKeys(std::string& error) {
++    const auto keys = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir) / "prod.keys";
++    std::error_code ec;
++    if (!fs::exists(keys, ec)) {
++        error = "Falta " + keys.string() +
++                "\nDumpea las claves de tu propia consola (p. ej. con Lockpick) y copialas ahi.";
++        return false;
++    }
++    return true;
++}
++
++} // namespace
++
++int main(int argc, char** argv) {
++    // Que el juego emulado no se pause si el usuario abre el menu HOME un instante.
++    Ounce::Hos::SetNoSuspend();
++
++    Common::Log::Initialize();
++    Common::Log::Start();
++    LOG_INFO(Frontend, "eden-ounce arrancando");
++
++    std::string error;
++    if (!CheckKeys(error)) {
++        Ounce::Hos::ShowFatal(error);
++        return 1;
++    }
++
++    std::string filepath = argc > 1 ? std::string{argv[1]} : std::string{};
++    if (filepath.empty()) {
++        filepath = Ounce::Hos::PickGame(kGamesDir);
++        if (filepath.empty()) {
++            return 0;
++        }
++    }
++    LOG_INFO(Frontend, "Juego: {}", filepath);
++
++    ConfigureForSwitch2();
++
++    Core::System system{};
++    InputCommon::InputSubsystem input_subsystem{};
++
++    system.Initialize();
++    system.ApplySettings();
++
++    auto window = std::make_unique<EdenOunce::EmuWindowOunce>(input_subsystem, system);
++
++    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
++    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
++    system.GetFileSystemController().CreateFactories(*system.GetFilesystem());
++    system.GetUserChannel().clear();
++
++    Service::AM::FrontendAppletParameters load_parameters{
++        .applet_id = Service::AM::AppletId::Application,
++    };
++    const Core::SystemResultStatus load_result = system.Load(*window, filepath, load_parameters);
++    if (load_result != Core::SystemResultStatus::Success) {
++        const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
++        std::string description = "Error de carga";
++        if (u16(load_result) > loader_id) {
++            description = Loader::GetResultStatusString(Loader::ResultStatus(u16(load_result) - loader_id));
++        }
++        LOG_CRITICAL(Frontend, "Load fallo: {} ({})", static_cast<u32>(load_result), description);
++        window.reset();
++        Ounce::Hos::ShowFatal("No se pudo cargar " + filepath + "\n" + description +
++                  "\nRevisa el log en sdmc:/switch/eden/log/");
++        return 1;
++    }
++
++    system.GPU().Start();
++    system.GetCpuManager().OnGpuReady();
++
++    if (Settings::values.use_disk_shader_cache.GetValue()) {
++        system.Renderer().ReadRasterizer()->LoadDiskResources(
++            system.GetApplicationProcessProgramID(), std::stop_token{},
++            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
++    }
++
++    system.RegisterExitCallback([&window] { window->RequestClose(); });
++
++    void(system.Run());
++
++    // El emulador corre en sus propios hilos (núcleos de CPU, GPU, servicios);
++    // este hilo solo bombea entrada y eventos del applet.
++    while (window->PumpEvents()) {
++        Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
++    }
++
++    if (system.IsPoweredOn()) {
++        system.Pause();
++        system.ShutdownMainProcess();
++    }
++    window.reset();
++    LOG_INFO(Frontend, "eden-ounce cerrado");
++    return 0;
++}
++
++#define VMA_IMPLEMENTATION
++#include "video_core/vulkan_common/vma.h"
+diff --git a/src/eden_ounce/pad_input.cpp b/src/eden_ounce/pad_input.cpp
+new file mode 100644
+index 0000000..39641fd
+--- /dev/null
++++ b/src/eden_ounce/pad_input.cpp
+@@ -0,0 +1,99 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Mandos reales (vía horizon.h) -> VirtualGamepad de Eden. Sin <switch.h>.
++
++#include <array>
++
++#include "eden_ounce/horizon.h"
++#include "eden_ounce/pad_input.h"
++#include "input_common/drivers/virtual_gamepad.h"
++#include "input_common/main.h"
++
++namespace EdenOunce {
++namespace {
++
++namespace Btn = Ounce::Hos::Button;
++using VB = InputCommon::VirtualGamepad::VirtualButton;
++using VS = InputCommon::VirtualGamepad::VirtualStick;
++
++struct ButtonMap {
++    std::uint64_t hid;
++    VB virt;
++};
++
++// Mismo orden que EmulatedController::LoadVirtualGamepadParams.
++constexpr std::array<ButtonMap, 18> kButtons{{
++    {Btn::A, VB::ButtonA},          {Btn::B, VB::ButtonB},
++    {Btn::X, VB::ButtonX},          {Btn::Y, VB::ButtonY},
++    {Btn::StickL, VB::StickL},      {Btn::StickR, VB::StickR},
++    {Btn::L, VB::TriggerL},         {Btn::R, VB::TriggerR},
++    {Btn::ZL, VB::TriggerZL},       {Btn::ZR, VB::TriggerZR},
++    {Btn::Plus, VB::ButtonPlus},    {Btn::Minus, VB::ButtonMinus},
++    {Btn::Left, VB::ButtonLeft},    {Btn::Up, VB::ButtonUp},
++    {Btn::Right, VB::ButtonRight},  {Btn::Down, VB::ButtonDown},
++    {Btn::AnySL, VB::ButtonSL},     {Btn::AnySR, VB::ButtonSR},
++}};
++
++// Índice de Eden para el mando portátil (NpadIdType::Handheld).
++constexpr std::size_t kHandheldIndex = 8;
++
++std::array<Ounce::Hos::PadSnapshot, Ounce::Hos::MaxPads> g_snap{};
++std::array<std::uint64_t, Ounce::Hos::MaxPads> g_last_buttons{};
++std::uint64_t g_exit_combo_start = 0;
++
++void Feed(InputCommon::VirtualGamepad& gamepad, std::size_t player,
++          const Ounce::Hos::PadSnapshot& pad, std::uint64_t changed) {
++    for (const auto& map : kButtons) {
++        if (changed & map.hid) {
++            gamepad.SetButtonState(player, map.virt, (pad.buttons & map.hid) != 0);
++        }
++    }
++    gamepad.SetStickPosition(player, VS::Left, pad.lx, pad.ly);
++    gamepad.SetStickPosition(player, VS::Right, pad.rx, pad.ry);
++}
++
++} // namespace
++
++void InitializePads() {
++    Ounce::Hos::InitPads();
++}
++
++bool PollPads(InputCommon::InputSubsystem& input_subsystem) {
++    auto* gamepad = input_subsystem.GetVirtualGamepad();
++    Ounce::Hos::PollPads(g_snap);
++    bool exit_requested = false;
++
++    for (std::size_t i = 0; i < g_snap.size(); ++i) {
++        const auto& pad = g_snap[i];
++        if (!pad.connected) {
++            continue;
++        }
++        const std::uint64_t changed = pad.buttons ^ g_last_buttons[i];
++        g_last_buttons[i] = pad.buttons;
++
++        Feed(*gamepad, i, pad, changed);
++        if (i != 0) {
++            continue;
++        }
++        // El jugador 1 también maneja el mando "portátil" del juego, para que
++        // funcione igual en modo portátil y en dock.
++        Feed(*gamepad, kHandheldIndex, pad, changed);
++
++        // Atajo de salida: + y - a la vez durante 1 s.
++        constexpr std::uint64_t combo = Btn::Plus | Btn::Minus;
++        if ((pad.buttons & combo) == combo) {
++            const std::uint64_t now = Ounce::Hos::MonotonicNs();
++            if (g_exit_combo_start == 0) {
++                g_exit_combo_start = now;
++            } else if (now - g_exit_combo_start > 1'000'000'000ULL) {
++                exit_requested = true;
++            }
++        } else {
++            g_exit_combo_start = 0;
++        }
++    }
++    return exit_requested;
++}
++
++} // namespace EdenOunce
+diff --git a/src/eden_ounce/pad_input.h b/src/eden_ounce/pad_input.h
+new file mode 100644
+index 0000000..3bf3324
+--- /dev/null
++++ b/src/eden_ounce/pad_input.h
+@@ -0,0 +1,20 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++namespace InputCommon {
++class InputSubsystem;
++}
++
++namespace EdenOunce {
++
++/// Configura HID de libounce para hasta 8 mandos.
++void InitializePads();
++
++/// Lee los mandos reales y los vuelca en el VirtualGamepad de Eden
++/// (jugador N del juego = mando N de la consola).
++/// Devuelve true si se pulsó el atajo de salida (+ y - a la vez durante 1 s).
++bool PollPads(InputCommon::InputSubsystem& input_subsystem);
++
++} // namespace EdenOunce
+diff --git a/src/input_common/CMakeLists.txt b/src/input_common/CMakeLists.txt
+index 840602f..fadedf4 100644
+--- a/src/input_common/CMakeLists.txt
++++ b/src/input_common/CMakeLists.txt
+@@ -53,6 +53,8 @@ if (ANDROID)
+         drivers/android.h)
+ 
+     target_link_libraries(input_common PRIVATE android)
++elseif (NINTENDO_SWITCH2)
++    # Sin SDL3 ni drivers de joycon por HID: el frontend alimenta VirtualGamepad con libounce.
+ else()
+     target_sources(input_common PRIVATE
+         drivers/joycon.cpp
+diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
+index 2609e8d..feb5be6 100644
+--- a/src/video_core/vulkan_common/vulkan.h
++++ b/src/video_core/vulkan_common/vulkan.h
+@@ -15,6 +15,8 @@
+ #define VK_USE_PLATFORM_ANDROID_KHR
+ #elif defined(__HAIKU__)
+ #define VK_USE_PLATFORM_XCB_KHR
++#elif defined(__SWITCH2__)
++#define VK_USE_PLATFORM_VI_NN
+ #else
+ #define VK_USE_PLATFORM_XLIB_KHR
+ #define VK_USE_PLATFORM_WAYLAND_KHR
+diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
+index 7f3d8ed..626c85d 100644
+--- a/src/video_core/vulkan_common/vulkan_instance.cpp
++++ b/src/video_core/vulkan_common/vulkan_instance.cpp
+@@ -59,6 +59,10 @@ namespace {
+     case Core::Frontend::WindowSystemType::Xcb:
+         extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+         break;
++#elif defined(__SWITCH2__)
++    case Core::Frontend::WindowSystemType::NintendoSwitch:
++        extensions.push_back(VK_NN_VI_SURFACE_EXTENSION_NAME);
++        break;
+ #else
+     case Core::Frontend::WindowSystemType::X11:
+         extensions.push_back(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+diff --git a/src/video_core/vulkan_common/vulkan_surface.cpp b/src/video_core/vulkan_common/vulkan_surface.cpp
+index 8b9dcb4..1bb0409 100644
+--- a/src/video_core/vulkan_common/vulkan_surface.cpp
++++ b/src/video_core/vulkan_common/vulkan_surface.cpp
+@@ -76,6 +76,23 @@ vk::SurfaceKHR CreateSurface(
+             throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+         }
+     }
++#elif defined(__SWITCH2__)
++    if (window_info.type == Core::Frontend::WindowSystemType::NintendoSwitch) {
++        // OunceVK presenta en el NWindow por defecto, igual que Mesa en Switch 1.
++        const VkViSurfaceCreateInfoNN vi_ci{
++            .sType = VK_STRUCTURE_TYPE_VI_SURFACE_CREATE_INFO_NN,
++            .pNext = nullptr,
++            .flags = 0,
++            .window = window_info.render_surface,
++        };
++        const auto vkCreateViSurfaceNN = reinterpret_cast<PFN_vkCreateViSurfaceNN>(
++            dld.vkGetInstanceProcAddr(*instance, "vkCreateViSurfaceNN"));
++        if (!vkCreateViSurfaceNN ||
++            vkCreateViSurfaceNN(*instance, &vi_ci, nullptr, &unsafe_surface) != VK_SUCCESS) {
++            LOG_ERROR(Render_Vulkan, "Failed to initialize VI surface");
++            throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
++        }
++    }
+ #else
+     if (window_info.type == Core::Frontend::WindowSystemType::X11) {
+         const VkXlibSurfaceCreateInfoKHR xlib_ci{
