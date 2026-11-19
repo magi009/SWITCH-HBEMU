@@ -25,6 +25,10 @@ bool MainLoop();         ///< appletMainLoop(): false si el sistema pide cerrar.
 bool IsDocked();         ///< true en modo TV/dock.
 bool IsInFocus();
 void SleepNs(std::int64_t ns);
+/// Inicializa los sockets BSD de libounce (los usa la red emulada y su socket de
+/// interrupción). Devuelve false si no hay servicio de red; el emulador sigue igual.
+bool InitNetwork();
+void ExitNetwork();
 std::uint64_t MonotonicNs();
 
 // ------------------------------------------------------------------ vídeo

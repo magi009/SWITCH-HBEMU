@@ -35,6 +35,14 @@ bool IsInFocus() {
     return appletGetFocusState() == AppletFocusState_InFocus;
 }
 
+bool InitNetwork() {
+    return R_SUCCEEDED(socketInitializeDefault());
+}
+
+void ExitNetwork() {
+    socketExit();
+}
+
 void SleepNs(std::int64_t ns) {
     svcSleepThread(ns);
 }

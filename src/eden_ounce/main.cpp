@@ -92,6 +92,9 @@ int main(int argc, char** argv) {
     Common::Log::Initialize();
     Common::Log::Start();
     LOG_INFO(Frontend, "eden-ounce arrancando");
+    if (!Ounce::Hos::InitNetwork()) {
+        LOG_WARNING(Frontend, "Sin sockets: la red emulada no funcionara");
+    }
 
     std::string error;
     if (!CheckKeys(error)) {
@@ -164,6 +167,7 @@ int main(int argc, char** argv) {
         system.ShutdownMainProcess();
     }
     window.reset();
+    Ounce::Hos::ExitNetwork();
     LOG_INFO(Frontend, "eden-ounce cerrado");
     return 0;
 }

@@ -1090,6 +1090,78 @@ index 79fde93..8ae027a 100644
  #else
      return static_cast<u64>(timegm(&tm));
  #endif
+diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
+index 01d37fb..1fbaefa 100644
+--- a/src/core/internal_network/network.cpp
++++ b/src/core/internal_network/network.cpp
+@@ -178,6 +178,58 @@ constexpr int SD_BOTH = SHUT_RDWR;
+ 
+ int interrupt_pipe_fd[2] = {-1, -1};
+ 
++#ifdef __SWITCH2__
++// Horizon no tiene pipe(): el "pipe" de interrupción es un socket UDP en 127.0.0.1.
++// [0] recibe (es lo que se mete en poll) y [1] envía un byte a [0] para despertarlo.
++sockaddr_in interrupt_addr{};
++
++void Initialize() {
++    interrupt_pipe_fd[0] = socket(AF_INET, SOCK_DGRAM, 0);
++    interrupt_pipe_fd[1] = socket(AF_INET, SOCK_DGRAM, 0);
++    if (interrupt_pipe_fd[0] < 0 || interrupt_pipe_fd[1] < 0) {
++        LOG_ERROR(Network, "Failed to create interrupt sockets (¿sockets sin inicializar?)");
++        return;
++    }
++    interrupt_addr.sin_family = AF_INET;
++    interrupt_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    interrupt_addr.sin_port = 0;
++    socklen_t len = sizeof(interrupt_addr);
++    if (bind(interrupt_pipe_fd[0], reinterpret_cast<sockaddr*>(&interrupt_addr), len) != 0 ||
++        getsockname(interrupt_pipe_fd[0], reinterpret_cast<sockaddr*>(&interrupt_addr), &len) != 0) {
++        LOG_ERROR(Network, "Failed to bind interrupt socket");
++    }
++    int flags = fcntl(interrupt_pipe_fd[0], F_GETFL);
++    fcntl(interrupt_pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
++}
++
++void Finalize() {
++    for (int& fd : interrupt_pipe_fd) {
++        if (fd >= 0) {
++            close(fd);
++            fd = -1;
++        }
++    }
++}
++
++void InterruptSocketOperations() {
++    if (interrupt_pipe_fd[1] < 0) {
++        return;
++    }
++    u8 value = 0;
++    sendto(interrupt_pipe_fd[1], &value, sizeof(value), 0,
++           reinterpret_cast<const sockaddr*>(&interrupt_addr), sizeof(interrupt_addr));
++}
++
++void AcknowledgeInterrupt() {
++    if (interrupt_pipe_fd[0] < 0) {
++        return;
++    }
++    u8 value = 0;
++    recv(interrupt_pipe_fd[0], &value, sizeof(value), 0);
++}
++
++#else
++
+ void Initialize() {
+     if (pipe(interrupt_pipe_fd) != 0) {
+         LOG_ERROR(Network, "Failed to create interrupt pipe!");
+@@ -209,6 +261,8 @@ void AcknowledgeInterrupt() {
+     }
+ }
+ 
++#endif // __SWITCH2__
++
+ SOCKET GetInterruptSocket() {
+     return interrupt_pipe_fd[0];
+ }
 diff --git a/src/core/internal_network/socket_proxy.cpp b/src/core/internal_network/socket_proxy.cpp
 index 744765b..7dc0e1a 100644
 --- a/src/core/internal_network/socket_proxy.cpp
@@ -1751,10 +1823,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..5d9c469
+index 0000000..865e6ff
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,105 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1790,6 +1862,14 @@ index 0000000..5d9c469
 +
 +bool IsInFocus() {
 +    return appletGetFocusState() == AppletFocusState_InFocus;
++}
++
++bool InitNetwork() {
++    return R_SUCCEEDED(socketInitializeDefault());
++}
++
++void ExitNetwork() {
++    socketExit();
 +}
 +
 +void SleepNs(std::int64_t ns) {
@@ -1854,10 +1934,10 @@ index 0000000..5d9c469
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
 new file mode 100644
-index 0000000..29c37f5
+index 0000000..d89e2e5
 --- /dev/null
 +++ b/src/eden_ounce/horizon.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,68 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1885,6 +1965,10 @@ index 0000000..29c37f5
 +bool IsDocked();         ///< true en modo TV/dock.
 +bool IsInFocus();
 +void SleepNs(std::int64_t ns);
++/// Inicializa los sockets BSD de libounce (los usa la red emulada y su socket de
++/// interrupción). Devuelve false si no hay servicio de red; el emulador sigue igual.
++bool InitNetwork();
++void ExitNetwork();
 +std::uint64_t MonotonicNs();
 +
 +// ------------------------------------------------------------------ vídeo
@@ -2046,10 +2130,10 @@ index 0000000..f883d4e
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..f425361
+index 0000000..dc27a13
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,176 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2144,6 +2228,9 @@ index 0000000..f425361
 +    Common::Log::Initialize();
 +    Common::Log::Start();
 +    LOG_INFO(Frontend, "eden-ounce arrancando");
++    if (!Ounce::Hos::InitNetwork()) {
++        LOG_WARNING(Frontend, "Sin sockets: la red emulada no funcionara");
++    }
 +
 +    std::string error;
 +    if (!CheckKeys(error)) {
@@ -2216,6 +2303,7 @@ index 0000000..f425361
 +        system.ShutdownMainProcess();
 +    }
 +    window.reset();
++    Ounce::Hos::ExitNetwork();
 +    LOG_INFO(Frontend, "eden-ounce cerrado");
 +    return 0;
 +}
@@ -2389,10 +2477,10 @@ index 840602f..eb0b824 100644
          drivers/joycon.cpp
 diff --git a/src/input_common/drivers/udp_client_horizon.cpp b/src/input_common/drivers/udp_client_horizon.cpp
 new file mode 100644
-index 0000000..aac5a6f
+index 0000000..03021e0
 --- /dev/null
 +++ b/src/input_common/drivers/udp_client_horizon.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,58 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2408,6 +2496,9 @@ index 0000000..aac5a6f
 +UDPClient::UDPClient(std::string input_engine_) : InputEngine(std::move(input_engine_)) {}
 +
 +UDPClient::~UDPClient() = default;
++
++UDPClient::ClientConnection::ClientConnection() = default;
++UDPClient::ClientConnection::~ClientConnection() = default;
 +
 +void UDPClient::ReloadSockets() {}
 +
@@ -2448,6 +2539,21 @@ index 0000000..aac5a6f
 +void CalibrationConfigurationJob::Stop() {}
 +
 +} // namespace InputCommon::CemuhookUDP
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 64d14ab..d0b14fe 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -418,6 +418,10 @@ endif()
+ target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
+ 
+ target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
++if (NINTENDO_SWITCH2)
++    # FFmpeg de los portlibs es estático: sus dependencias privadas (dav1d, zlib) van detrás.
++    target_link_libraries(video_core PRIVATE dav1d ZLIB::ZLIB)
++endif()
+ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
+ 
+ add_dependencies(video_core host_shaders)
 diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
 index 2609e8d..feb5be6 100644
 --- a/src/video_core/vulkan_common/vulkan.h
