@@ -1,14 +1,17 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b3a875a..a6e1413 100644
+index b3a875a..8cf4c19 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -414,8 +414,15 @@ set(BUILD_TESTING OFF)
+@@ -414,11 +414,33 @@ set(BUILD_TESTING OFF)
  set(ENABLE_TESTING OFF)
  
  # boost
 -set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
 -    process filesystem crc variant pfr)
 +if (NINTENDO_SWITCH2)
++    # newlib no anuncia _POSIX_THREADS, pero libounce implementa pthreads: sin esto
++    # Boost.Config cae en la rama de Win32 (InitializeCriticalSection...).
++    add_compile_definitions(BOOST_HAS_PTHREADS)
 +    # Sin process ni filesystem (fork/exec y una biblioteca compilada que Horizon no necesita).
 +    # context sí: las fibras del núcleo usan su fcontext en ensamblador (aarch64/aapcs/elf).
 +    set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
@@ -20,7 +23,22 @@ index b3a875a..a6e1413 100644
  
  AddJsonPackage(boost)
  
-@@ -563,7 +570,7 @@ if (NOT YUZU_STATIC_ROOM)
++if (NINTENDO_SWITCH2)
++    # dlmalloc de Boost.Container: sin mmap en Horizon (usa sbrk de newlib).
++    if (TARGET boost_container)
++        target_compile_definitions(boost_container PRIVATE LACKS_SYS_MMAN_H=1 HAVE_MMAP=0)
++    endif()
++    # Boost.Context pregunta getrlimit(RLIMIT_STACK); shim en src/eden_ounce/compat.
++    if (TARGET boost_context)
++        target_include_directories(boost_context BEFORE PRIVATE
++            ${PROJECT_SOURCE_DIR}/src/eden_ounce/compat)
++    endif()
++endif()
++
+ # really annoying thing where boost::headers doesn't work with cpm
+ # TODO(crueter) investigate
+ set(BOOST_NO_HEADERS ${Boost_ADDED})
+@@ -563,7 +585,7 @@ if (NOT YUZU_STATIC_ROOM)
          find_package(oaknut)
      endif()
  
@@ -110,10 +128,35 @@ index f1bf099..5db35c5 100644
      AddJsonPackage(ffmpeg-ci)
  
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 305c744..7f10195 100644
+index 305c744..c79636f 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -321,6 +321,10 @@ add_subdirectory(video_core)
+@@ -262,8 +262,11 @@ endif()
+ # Jacinth (json)
+ AddJsonPackage(jacinth)
+ 
+-# Hydrocarbon (http)
+-AddJsonPackage(hydrocarbon)
++# Hydrocarbon (http). En Switch 2 no: su capa de sockets no conoce Horizon y el
++# emulador no necesita HTTP (sin buscador de actualizaciones ni servicios web).
++if (NOT NINTENDO_SWITCH2)
++    AddJsonPackage(hydrocarbon)
++endif()
+ 
+ # Disable rtti, enable fwrapv, link POSIX threads
+ macro(fix_modules target type)
+@@ -293,7 +296,9 @@ else()
+ endif()
+ 
+ # ditto, hydrocarbon
+-if (hydrocarbon_ADDED)
++if (NINTENDO_SWITCH2)
++    # sin hydrocarbon
++elseif (hydrocarbon_ADDED)
+     fix_modules(hydrocarbon PRIVATE)
+ else()
+     fix_modules(hydro::carbon INTERFACE)
+@@ -321,6 +326,10 @@ add_subdirectory(video_core)
  add_subdirectory(hid_core)
  add_subdirectory(input_common)
  add_subdirectory(frontend_common)
@@ -148,7 +191,7 @@ index b244d65..a50d2cb 100644
  
  create_target_directory_groups(audio_core)
 diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
-index 0be3249..b60f46b 100644
+index 0be3249..25f8085 100644
 --- a/src/common/CMakeLists.txt
 +++ b/src/common/CMakeLists.txt
 @@ -159,10 +159,15 @@ if(WIN32)
@@ -168,11 +211,17 @@ index 0be3249..b60f46b 100644
  if(ANDROID)
      target_sources(
          common
-@@ -239,7 +244,11 @@ else()
+@@ -238,8 +243,16 @@ if (BOOST_NO_HEADERS)
+ else()
      target_link_libraries(common PUBLIC Boost::headers)
  endif()
- target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
+-target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
 -target_link_libraries(common PUBLIC Boost::filesystem Boost::context)
++if (NINTENDO_SWITCH2)
++    target_link_libraries(common PRIVATE OpenSSL::SSL jacinth::jacinth)
++else()
++    target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
++endif()
 +if (NINTENDO_SWITCH2)
 +    target_link_libraries(common PUBLIC Boost::context)
 +else()
@@ -563,6 +612,203 @@ index 86a3abc..be74008 100644
  #else
      mem_info.TotalPhysicalMemory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
      mem_info.TotalSwapMemory = 0;
+diff --git a/src/common/multi_level_page_table.h b/src/common/multi_level_page_table.h
+index 31f6676..103733f 100644
+--- a/src/common/multi_level_page_table.h
++++ b/src/common/multi_level_page_table.h
+@@ -30,7 +30,12 @@ public:
+           first_level_shift{std::exchange(other.first_level_shift, 0)},
+           first_level_chunk_size{std::exchange(other.first_level_chunk_size, 0)},
+           first_level_map{std::move(other.first_level_map)}, base_ptr{std::exchange(other.base_ptr,
+-                                                                                    nullptr)} {}
++                                                                                    nullptr)}
++#ifdef __SWITCH2__
++          , chunk_entry_bits{std::exchange(other.chunk_entry_bits, 0)}
++          , chunk_entry_mask{std::exchange(other.chunk_entry_mask, 0)}
++#endif
++          {}
+ 
+     MultiLevelPageTable& operator=(MultiLevelPageTable&& other) noexcept {
+         address_space_bits = std::exchange(other.address_space_bits, 0);
+@@ -41,11 +46,35 @@ public:
+         alloc_size = std::exchange(other.alloc_size, 0);
+         first_level_map = std::move(other.first_level_map);
+         base_ptr = std::exchange(other.base_ptr, nullptr);
++#ifdef __SWITCH2__
++        chunk_entry_bits = std::exchange(other.chunk_entry_bits, 0);
++        chunk_entry_mask = std::exchange(other.chunk_entry_mask, 0);
++#endif
+         return *this;
+     }
+ 
+     void ReserveRange(u64 start, std::size_t size);
+ 
++#ifdef __SWITCH2__
++    // Horizon no tiene reservas perezosas: en vez de un bloque contiguo de hasta 1 GiB,
++    // cada trozo de primer nivel se pide al heap cuando se reserva (ReserveRange).
++    [[nodiscard]] const BaseAddr& operator[](std::size_t index) const {
++        static const BaseAddr zero{};
++        const std::size_t level = index >> chunk_entry_bits;
++        if (level >= first_level_map.size() || !first_level_map[level]) {
++            return zero;
++        }
++        return static_cast<const BaseAddr*>(first_level_map[level])[index & chunk_entry_mask];
++    }
++
++    [[nodiscard]] BaseAddr& operator[](std::size_t index) {
++        const std::size_t level = index >> chunk_entry_bits;
++        if (!first_level_map[level]) {
++            AllocateLevel(level);
++        }
++        return static_cast<BaseAddr*>(first_level_map[level])[index & chunk_entry_mask];
++    }
++#else
+     [[nodiscard]] const BaseAddr& operator[](std::size_t index) const {
+         return base_ptr[index];
+     }
+@@ -53,6 +82,7 @@ public:
+     [[nodiscard]] BaseAddr& operator[](std::size_t index) {
+         return base_ptr[index];
+     }
++#endif
+ 
+     [[nodiscard]] BaseAddr* data() {
+         return base_ptr;
+@@ -73,6 +103,10 @@ private:
+     std::size_t alloc_size{};
+     std::vector<void*> first_level_map{};
+     BaseAddr* base_ptr{};
++#ifdef __SWITCH2__
++    std::size_t chunk_entry_bits{};
++    std::size_t chunk_entry_mask{};
++#endif
+ };
+ 
+ } // namespace Common
+diff --git a/src/common/multi_level_page_table.inc b/src/common/multi_level_page_table.inc
+index 79125e8..76f7563 100644
+--- a/src/common/multi_level_page_table.inc
++++ b/src/common/multi_level_page_table.inc
+@@ -3,6 +3,8 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#elif defined(__SWITCH2__)
++#include <cstdlib>
+ #else
+ #include <sys/mman.h>
+ #endif
+@@ -26,6 +28,11 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
+     alloc_size = (1ULL << (address_space_bits - page_bits)) * sizeof(BaseAddr);
+     std::size_t first_level_size = 1ULL << first_level_bits;
+     first_level_map.resize(first_level_size, nullptr);
++#if defined(__SWITCH2__)
++    // Sin bloque contiguo: los trozos se crean en AllocateLevel (ver el header).
++    chunk_entry_bits = first_level_shift - page_bits;
++    chunk_entry_mask = (std::size_t{1} << chunk_entry_bits) - 1;
++#else
+ #ifdef _WIN32
+     void* base{VirtualAlloc(nullptr, alloc_size, MEM_RESERVE, PAGE_READWRITE)};
+ #else
+@@ -35,10 +42,16 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
+ #endif
+     ASSERT(base);
+     base_ptr = reinterpret_cast<BaseAddr*>(base);
++#endif
+ }
+ 
+ template <typename BaseAddr>
+ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
++#if defined(__SWITCH2__)
++    for (void* chunk : first_level_map) {
++        std::free(chunk);
++    }
++#else
+     if (!base_ptr) {
+         return;
+     }
+@@ -47,6 +60,7 @@ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
+ #else
+     ASSERT(munmap(base_ptr, alloc_size) == 0);
+ #endif
++#endif
+ }
+ 
+ template <typename BaseAddr>
+@@ -60,6 +74,11 @@ void MultiLevelPageTable<BaseAddr>::ReserveRange(u64 start, std::size_t size) {
+ 
+ template <typename BaseAddr>
+ void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
++#ifdef __SWITCH2__
++    void* base = std::calloc(1, first_level_chunk_size);
++    ASSERT(base);
++    first_level_map[index] = base;
++#else
+     void* ptr = reinterpret_cast<char *>(base_ptr) + index * first_level_chunk_size;
+ #ifdef _WIN32
+     void* base = VirtualAlloc(ptr, first_level_chunk_size, MEM_COMMIT, PAGE_READWRITE);
+@@ -68,6 +87,7 @@ void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
+     void* base = ptr;
+ #endif
+     first_level_map[index] = base;
++#endif
+ }
+ 
+ } // namespace Common
+diff --git a/src/common/net/net.cpp b/src/common/net/net.cpp
+index 22a757d..41c85b5 100644
+--- a/src/common/net/net.cpp
++++ b/src/common/net/net.cpp
+@@ -1,6 +1,43 @@
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#ifdef __SWITCH2__
++
++// Switch 2: sin HTTP (hydrocarbon no soporta Horizon). Todo devuelve "sin datos",
++// igual que si no hubiera conexión; nadie en el núcleo depende de estas respuestas.
++#include "common/net/net.h"
++
++namespace Common::Net {
++
++std::vector<NamedAsset> GetPlatformAssets(const Release&) {
++    return {};
++}
++std::optional<std::string> MakeRequest(const std::string&) {
++    return std::nullopt;
++}
++std::optional<std::string> MakeRequest(const std::string_view) {
++    return std::nullopt;
++}
++std::vector<Release> GetReleases() {
++    return {};
++}
++std::optional<Release> GetLatestRelease() {
++    return std::nullopt;
++}
++std::optional<std::string> GetReleasesBody() {
++    return std::nullopt;
++}
++std::vector<Release> GetReleasesFromJson(const std::string&) {
++    return {};
++}
++bool HeadRequest(const std::string&) {
++    return false;
++}
++
++} // namespace Common::Net
++
++#else // __SWITCH2__
++
+ #include <optional>
+ #include <utility>
+ 
+@@ -203,3 +240,5 @@ bool HeadRequest(const std::string& url) {
+ }
+ 
+ } // namespace Common::Net
++
++#endif // __SWITCH2__
 diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
 index 796bae9..7f76f90 100644
 --- a/src/common/sparse_large_vector.cpp
@@ -1261,6 +1507,48 @@ index 0000000..f70c16b
 +    OUTPUT ${CMAKE_BINARY_DIR}/eden.nro
 +    NACP   eden-ounce.nacp   # icono por defecto de libounce
 +)
+diff --git a/src/eden_ounce/compat/sys/resource.h b/src/eden_ounce/compat/sys/resource.h
+new file mode 100644
+index 0000000..413de20
+--- /dev/null
++++ b/src/eden_ounce/compat/sys/resource.h
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Shim de <sys/resource.h> para Horizon, solo para Boost.Context
++// (stack_traits.cpp pregunta el límite de pila con getrlimit).
++// newlib trae un sys/resource.h sin rlimit; en Horizon la pila no tiene límite
++// impuesto por el sistema: el tamaño lo fija quien crea el hilo o la fibra.
++
++#pragma once
++
++#include <sys/types.h>
++
++typedef unsigned long rlim_t;
++
++#define RLIM_INFINITY (~(rlim_t)0)
++#define RLIMIT_STACK 3
++
++struct rlimit {
++    rlim_t rlim_cur;
++    rlim_t rlim_max;
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++static inline int getrlimit(int resource, struct rlimit* limit) {
++    (void)resource;
++    limit->rlim_cur = RLIM_INFINITY;
++    limit->rlim_max = RLIM_INFINITY;
++    return 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
 diff --git a/src/eden_ounce/emu_window_ounce.cpp b/src/eden_ounce/emu_window_ounce.cpp
 new file mode 100644
 index 0000000..32f2c0a
@@ -2018,10 +2306,31 @@ index 0000000..3bf3324
 +
 +} // namespace EdenOunce
 diff --git a/src/input_common/CMakeLists.txt b/src/input_common/CMakeLists.txt
-index 840602f..fadedf4 100644
+index 840602f..eb0b824 100644
 --- a/src/input_common/CMakeLists.txt
 +++ b/src/input_common/CMakeLists.txt
-@@ -53,6 +53,8 @@ if (ANDROID)
+@@ -15,7 +15,6 @@ add_library(input_common STATIC
+     drivers/tas_input.h
+     drivers/touch_screen.cpp
+     drivers/touch_screen.h
+-    drivers/udp_client.cpp
+     drivers/udp_client.h
+     drivers/virtual_amiibo.cpp
+     drivers/virtual_amiibo.h
+@@ -47,12 +46,21 @@ else()
+     target_compile_options(input_common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wconversion>)
+ endif()
+ 
++if (NINTENDO_SWITCH2)
++    # Sin Boost.Asio sobre sockets POSIX: cliente UDP vacío.
++    target_sources(input_common PRIVATE drivers/udp_client_horizon.cpp)
++else()
++    target_sources(input_common PRIVATE drivers/udp_client.cpp)
++endif()
++
+ if (ANDROID)
+     target_sources(input_common PRIVATE
+         drivers/android.cpp
          drivers/android.h)
  
      target_link_libraries(input_common PRIVATE android)
@@ -2030,6 +2339,67 @@ index 840602f..fadedf4 100644
  else()
      target_sources(input_common PRIVATE
          drivers/joycon.cpp
+diff --git a/src/input_common/drivers/udp_client_horizon.cpp b/src/input_common/drivers/udp_client_horizon.cpp
+new file mode 100644
+index 0000000..aac5a6f
+--- /dev/null
++++ b/src/input_common/drivers/udp_client_horizon.cpp
+@@ -0,0 +1,55 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Switch 2: cliente cemuhook (UDP) vacío. El real usa Boost.Asio sobre sockets POSIX
++// (sys/uio.h, readv/writev...) que libounce no ofrece; en la consola los mandos son nativos.
++
++#include "input_common/drivers/udp_client.h"
++
++namespace InputCommon::CemuhookUDP {
++
++class Socket {};
++
++UDPClient::UDPClient(std::string input_engine_) : InputEngine(std::move(input_engine_)) {}
++
++UDPClient::~UDPClient() = default;
++
++void UDPClient::ReloadSockets() {}
++
++std::vector<Common::ParamPackage> UDPClient::GetInputDevices() const {
++    return {};
++}
++
++ButtonMapping UDPClient::GetButtonMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++AnalogMapping UDPClient::GetAnalogMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++MotionMapping UDPClient::GetMotionMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++Common::Input::ButtonNames UDPClient::GetUIName(const Common::ParamPackage&) const {
++    return Common::Input::ButtonNames::Invalid;
++}
++
++bool UDPClient::IsStickInverted(const Common::ParamPackage&) {
++    return false;
++}
++
++void TestCommunication(const std::string&, u16, const std::function<void()>&,
++                       const std::function<void()>& failure_callback) {
++    failure_callback();
++}
++
++CalibrationConfigurationJob::CalibrationConfigurationJob(
++    const std::string&, u16, std::function<void(Status)>, std::function<void(u16, u16, u16, u16)>) {}
++
++CalibrationConfigurationJob::~CalibrationConfigurationJob() = default;
++
++void CalibrationConfigurationJob::Stop() {}
++
++} // namespace InputCommon::CemuhookUDP
 diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
 index 2609e8d..feb5be6 100644
 --- a/src/video_core/vulkan_common/vulkan.h
