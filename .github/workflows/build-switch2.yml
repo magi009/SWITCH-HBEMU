@@ -24,7 +24,6 @@ jobs:
         shell: bash
     env:
       DEVKITPRO: /opt/devkitpro
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 4G
     steps:
       - name: Herramientas del host
@@ -97,6 +96,9 @@ jobs:
 
       - name: Compilar eden.nro
         run: |
+          # Dentro del contenedor el workspace es /__w/..., no ${{ github.workspace }}:
+          # ccache tiene que escribir en la carpeta que guardan los pasos de caché.
+          export CCACHE_DIR="$PWD/.ccache"
           ccache -z || true
           # -k 0: seguir compilando tras un error para ver TODOS los fallos de una vez.
           BUILD_ARGS="-- -k 0" ./build.sh "$PWD/eden" 2>&1 | tee build.log
