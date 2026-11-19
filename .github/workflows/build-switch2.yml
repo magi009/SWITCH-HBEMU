@@ -54,7 +54,7 @@ jobs:
           cat "$DEVKITPRO/ounce-devkit-version.txt"
           ls "$DEVKITPRO/portlibs/switch2/lib"
           # ¿Qué portlibs de Switch 1 trae ya la imagen?
-          ls "$DEVKITPRO/portlibs/switch/lib" | head -100 || true
+          ls "$DEVKITPRO/portlibs/switch/lib" | tr "\n" " " || true
 
       - name: Caché de OpenSSL
         id: openssl-cache
