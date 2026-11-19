@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 350
     # La misma base que el Dockerfile de ounce-devkit.
     container: docker.io/devkitpro/devkita64:20260219
+    defaults:
+      run:
+        # bash con -eo pipefail: un fallo dentro de "| tee" también hace fallar el paso.
+        shell: bash
     env:
       DEVKITPRO: /opt/devkitpro
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -91,7 +95,6 @@ jobs:
 
       - name: Compilar eden.nro
         run: |
-          set -o pipefail 2>/dev/null || true
           ccache -z || true
           # -k 0: seguir compilando tras un error para ver TODOS los fallos de una vez.
           BUILD_ARGS="-- -k 0" ./build.sh "$PWD/eden" 2>&1 | tee build.log
