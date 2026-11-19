@@ -1,8 +1,26 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b3a875a..a5e956a 100644
+index b3a875a..a6e1413 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -563,7 +563,7 @@ if (NOT YUZU_STATIC_ROOM)
+@@ -414,8 +414,15 @@ set(BUILD_TESTING OFF)
+ set(ENABLE_TESTING OFF)
+ 
+ # boost
+-set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
+-    process filesystem crc variant pfr)
++if (NINTENDO_SWITCH2)
++    # Sin process ni filesystem (fork/exec y una biblioteca compilada que Horizon no necesita).
++    # context sí: las fibras del núcleo usan su fcontext en ensamblador (aarch64/aapcs/elf).
++    set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
++        context crc variant pfr)
++else()
++    set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
++        process filesystem crc variant pfr)
++endif()
+ 
+ AddJsonPackage(boost)
+ 
+@@ -563,7 +570,7 @@ if (NOT YUZU_STATIC_ROOM)
          find_package(oaknut)
      endif()
  
@@ -70,6 +88,40 @@ index b244d65..a50d2cb 100644
 +endif()
  
  create_target_directory_groups(audio_core)
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 0be3249..b60f46b 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -159,10 +159,15 @@ if(WIN32)
+     target_link_libraries(common PRIVATE ntdll)
+ endif()
+ 
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT NINTENDO_SWITCH2)
+     target_sources(common PRIVATE signal_chain.cpp signal_chain.h)
+ endif()
+ 
++if(NINTENDO_SWITCH2)
++    # Único punto de common/ que habla con libounce (ver horizon/horizon_os.h).
++    target_sources(common PRIVATE horizon/horizon_os.cpp horizon/horizon_os.h)
++endif()
++
+ if(ANDROID)
+     target_sources(
+         common
+@@ -239,7 +244,11 @@ else()
+     target_link_libraries(common PUBLIC Boost::headers)
+ endif()
+ target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
+-target_link_libraries(common PUBLIC Boost::filesystem Boost::context)
++if (NINTENDO_SWITCH2)
++    target_link_libraries(common PUBLIC Boost::context)
++else()
++    target_link_libraries(common PUBLIC Boost::filesystem Boost::context)
++endif()
+ 
+ if (lz4_ADDED)
+     target_include_directories(common PRIVATE ${lz4_SOURCE_DIR}/lib)
 diff --git a/src/common/dynamic_library.cpp b/src/common/dynamic_library.cpp
 index 9bf2c94..f5052ad 100644
 --- a/src/common/dynamic_library.cpp
@@ -214,6 +266,116 @@ index f040e84..daf5e7a 100644
  }
  
  fs::path GetDataDirectory(const std::string& env_name) {
+diff --git a/src/common/fs/symlink.cpp b/src/common/fs/symlink.cpp
+index e8a27a1..1d2e790 100644
+--- a/src/common/fs/symlink.cpp
++++ b/src/common/fs/symlink.cpp
+@@ -8,7 +8,9 @@
+ #include <windows.h>
+ #endif
+ 
++#ifndef __SWITCH2__
+ #include <boost/filesystem.hpp>
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -50,7 +52,13 @@ bool CreateSymlink(fs::path from, fs::path to)
+ 
+ bool IsSymlink(const fs::path &path)
+ {
++#ifdef __SWITCH2__
++    // Boost.Filesystem es una biblioteca compilada; en la SD no hay enlaces simbólicos.
++    std::error_code ec;
++    return fs::is_symlink(path, ec);
++#else
+     return boost::filesystem::is_symlink(boost::filesystem::path{path});
++#endif
+ }
+ 
+ } // namespace Common::FS
+diff --git a/src/common/horizon/horizon_os.cpp b/src/common/horizon/horizon_os.cpp
+new file mode 100644
+index 0000000..c6f3073
+--- /dev/null
++++ b/src/common/horizon/horizon_os.cpp
+@@ -0,0 +1,38 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Único archivo de common/ que incluye <switch.h>. No incluir headers de Eden aquí.
++
++#include <bit>
++
++#include <switch.h>
++
++#include "common/horizon/horizon_os.h"
++
++namespace Common::Horizon {
++
++std::uint64_t TotalMemorySize() {
++    u64 value = 0;
++    svcGetInfo(&value, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    return value;
++}
++
++std::uint64_t UsedMemorySize() {
++    u64 value = 0;
++    svcGetInfo(&value, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++    return value;
++}
++
++void SetCurrentThreadPriority(int horizon_priority) {
++    svcSetThreadPriority(threadGetCurHandle(), static_cast<u32>(horizon_priority));
++}
++
++int CoreCount() {
++    u64 mask = 0;
++    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || mask == 0) {
++        return 3; // lo mínimo que un juego tiene garantizado
++    }
++    return std::popcount(mask);
++}
++
++} // namespace Common::Horizon
+diff --git a/src/common/horizon/horizon_os.h b/src/common/horizon/horizon_os.h
+new file mode 100644
+index 0000000..d318b82
+--- /dev/null
++++ b/src/common/horizon/horizon_os.h
+@@ -0,0 +1,32 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Puente mínimo hacia Horizon (libounce) para el código común de Eden.
++//
++// libnx y Eden no pueden compartir una unidad de compilación (libnx define
++// `struct Service`, `u128` y macros como BIT()). Este header solo usa tipos
++// estándar; la implementación (horizon_os.cpp) es la única que incluye <switch.h>.
++
++#pragma once
++
++#ifdef __SWITCH2__
++
++#include <cstdint>
++
++namespace Common::Horizon {
++
++/// Memoria total concedida al proceso (svcGetInfo TotalMemorySize).
++std::uint64_t TotalMemorySize();
++
++/// Memoria ya usada por el proceso (svcGetInfo UsedMemorySize).
++std::uint64_t UsedMemorySize();
++
++/// Cambia la prioridad del hilo actual. Horizon: número menor = más prioridad.
++void SetCurrentThreadPriority(int horizon_priority);
++
++/// Núcleos en los que puede correr el proceso.
++int CoreCount();
++
++} // namespace Common::Horizon
++
++#endif // __SWITCH2__
 diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
 index 75a9da8..b917d14 100644
 --- a/src/common/host_memory.cpp
@@ -319,7 +481,7 @@ index a7fd053..db06e04 100644
      class Impl;
      std::unique_ptr<Impl> impl;
 diff --git a/src/common/memory_detect.cpp b/src/common/memory_detect.cpp
-index 86a3abc..2de08bd 100644
+index 86a3abc..be74008 100644
 --- a/src/common/memory_detect.cpp
 +++ b/src/common/memory_detect.cpp
 @@ -12,6 +12,8 @@
@@ -327,23 +489,179 @@ index 86a3abc..2de08bd 100644
  #elif defined(__linux__)
  #include <sys/sysinfo.h>
 +#elif defined(__SWITCH2__)
-+#include <switch.h>
++#include "common/horizon/horizon_os.h"
  #else
  #include <unistd.h>
  #endif
-@@ -56,6 +58,12 @@ static MemoryInfo Detect() {
+@@ -56,6 +58,10 @@ static MemoryInfo Detect() {
      sysinfo(&meminfo);
      mem_info.TotalPhysicalMemory = meminfo.totalram;
      mem_info.TotalSwapMemory = meminfo.totalswap;
 +#elif defined(__SWITCH2__)
 +    // Memoria que el kernel concede a este proceso (el pool del juego anfitrión).
-+    u64 total = 0;
-+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-+    mem_info.TotalPhysicalMemory = total;
++    mem_info.TotalPhysicalMemory = Common::Horizon::TotalMemorySize();
 +    mem_info.TotalSwapMemory = 0;
  #else
      mem_info.TotalPhysicalMemory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
      mem_info.TotalSwapMemory = 0;
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index 796bae9..7f76f90 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -9,6 +9,9 @@
+ #include <algorithm>
+ #include <windows.h>
+ #include <mutex>
++#elif defined(__SWITCH2__)
++#include <cstdlib>
++#include <cstring>
+ #else
+ #include <sys/mman.h>
+ #endif
+@@ -106,16 +109,20 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
+ }
+ #endif
+ 
++#ifndef __SWITCH2__
+ #ifndef MAP_NOCORE
+ #define MAP_NOCORE 0
+ #endif
+ #ifndef MADV_FREE
+ #define MADV_FREE MADV_DONTNEED
+ #endif
++#endif
+ 
+ void DecommitVectorPage(uintptr_t base) noexcept {
+ #if defined(_WIN32)
+     VirtualFree(reinterpret_cast<LPVOID>(base), HostPageSize, MEM_DECOMMIT);
++#elif defined(__SWITCH2__)
++    std::memset(reinterpret_cast<void*>(base), 0, HostPageSize);
+ #elif defined(__linux__)
+     // Linux's MADV_DONTNEED zeros out pages for us
+     madvise(reinterpret_cast<void*>(base), HostPageSize, MADV_DONTNEED);
+@@ -147,6 +154,12 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
+         base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+     }
+     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
++#elif defined(__SWITCH2__)
++    // Sin reserva perezosa en Horizon: se paga toda la memoria por adelantado.
++    // La tabla de páginas de un invitado de 39 bits son 1 GiB (2^27 entradas x 8 bytes).
++    void* base = std::aligned_alloc(HostPageSize, size);
++    ASSERT_MSG(base, "No hay memoria para un vector de {:#x} bytes", size);
++    std::memset(base, 0, size);
+ #else
+     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
+     if (base == MAP_FAILED)
+@@ -166,6 +179,8 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
+     std::lock_guard lock(vector_regions_mutex);
+     std::erase_if(vector_regions, [base](const auto& r) {return r.first == reinterpret_cast<u64>(base); });
+     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
++#elif defined(__SWITCH2__)
++    std::free(base);
+ #else
+     ASSERT(munmap(base, size) == 0);
+ #endif
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 8496c28..b583903 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -12,7 +12,7 @@
+ #include <utility>
+ #include <vector>
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__SWITCH2__)
+ #include <unistd.h>
+ #include <sys/mman.h>
+ #endif
+@@ -22,11 +22,13 @@
+ 
+ namespace Common {
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__SWITCH2__)
+ constexpr u64 HostPageSize = 0x1000;
+ constexpr u64 HostPageBits = 12;
+ constexpr u64 HostPageMask = ~(HostPageSize - 1);
++#ifdef _WIN32
+ bool CommitVectorPage(uintptr_t addr, bool write) noexcept;
++#endif
+ #else
+ inline const u64 HostPageSize = sysconf(_SC_PAGESIZE);
+ inline const u64 HostPageBits = std::countr_zero(HostPageSize);
+@@ -183,6 +185,9 @@ private:
+         if (!CommitVectorPage(page, true)) {
+             return false;
+         }
++#elif defined(__SWITCH2__)
++        // Horizon no tiene páginas perezosas: todo el vector ya está reservado y a cero.
++        (void)page;
+ #else
+         if (mprotect(reinterpret_cast<void*>(page), HostPageSize, PROT_READ | PROT_WRITE) != 0) {
+             LOG_ERROR(Common_Memory, "Failed to commit large buffer region at index {}, error {}", index, strerror(errno));
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3..4a7c8d4 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -15,6 +15,9 @@
+ #include "common/logging.h"
+ #include "common/assert.h"
+ #include "common/thread.h"
++#ifdef __SWITCH2__
++#include "common/horizon/horizon_os.h"
++#endif
+ #ifdef __APPLE__
+ #include <mach/mach.h>
+ #elif defined(__HAIKU__)
+@@ -484,6 +487,19 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
+         return;
+     }
+     RememberCurrentThreadNice(tid, nice_value);
++#elif defined(__SWITCH2__)
++    // Horizon: rango de aplicación 0x18..0x3F, menor = más prioridad; 0x2C es el normal.
++    const int horizon_priority = [&]() {
++        switch (new_priority) {
++        case ThreadPriority::Low: return 0x2E;
++        case ThreadPriority::Normal: return 0x2C;
++        case ThreadPriority::High: return 0x2B;
++        case ThreadPriority::VeryHigh: return 0x2A;
++        case ThreadPriority::Critical: return 0x28;
++        default: return 0x2C;
++        }
++    }();
++    Common::Horizon::SetCurrentThreadPriority(horizon_priority);
+ #elif defined(__linux__)
+     const int nice_value = NiceValueForPriority(new_priority);
+     if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {
+@@ -529,8 +545,9 @@ void SetCurrentThreadName(const char* name) {
+         buf[len] = '\0';
+         pthread_setname_np(pthread_self(), buf);
+     }
+-#elif defined(_WIN32)
+-    // MinGW with the POSIX threading model does not support pthread_setname_np
++#elif defined(_WIN32) || defined(__SWITCH2__)
++    // MinGW with the POSIX threading model does not support pthread_setname_np.
++    // Horizon no tiene nombres de hilo.
+     // See for reference
+     // https://gitlab.freedesktop.org/mesa/mesa/-/blame/main/src/util/u_thread.c?ref_type=heads#L75
+     (void)name;
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 6995333..f7ecfb6 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -1215,7 +1215,11 @@ if (MSVC)
+ endif()
+ 
+ if (BOOST_NO_HEADERS)
+-    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
++    if (NINTENDO_SWITCH2)
++        target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::crc)
++    else()
++        target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
++    endif()
+ else()
+     target_link_libraries(core PUBLIC Boost::headers)
+ endif()
 diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 index 28c731f..0f7ced8 100644
 --- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
@@ -378,6 +696,50 @@ index b4d18d3..f91577e 100644
      config.code_cache_size = std::uint32_t(128_MiB);
  #else
      config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/debugger/debugger.cpp b/src/core/debugger/debugger.cpp
+index 7c887ad..8b9f1d9 100644
+--- a/src/core/debugger/debugger.cpp
++++ b/src/core/debugger/debugger.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifndef __SWITCH2__
++
+ #include <mutex>
+ #include <utility>
+ #include <type_traits>
+@@ -400,3 +402,30 @@ void Debugger::NotifyShutdown() {
+ }
+ 
+ } // namespace Core
++
++#else // __SWITCH2__
++
++// En Switch 2 no hay depurador GDB: necesita Boost.Asio + Boost.Process (pipes POSIX).
++// Esta versión vacía mantiene la interfaz para que el núcleo compile sin cambios.
++#include "core/debugger/debugger.h"
++
++namespace Core {
++
++class DebuggerImpl {};
++
++Debugger::Debugger(Core::System&, u16) {}
++Debugger::~Debugger() = default;
++
++bool Debugger::NotifyThreadStopped(Kernel::KThread*) {
++    return false;
++}
++
++bool Debugger::NotifyThreadWatchpoint(Kernel::KThread*, const Kernel::DebugWatchpoint&) {
++    return false;
++}
++
++void Debugger::NotifyShutdown() {}
++
++} // namespace Core
++
++#endif // __SWITCH2__
 diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
 index ee7a769..2515a51 100644
 --- a/src/core/frontend/emu_window.h
@@ -390,6 +752,30 @@ index ee7a769..2515a51 100644
  };
  
  /**
+diff --git a/src/core/tools/renderdoc.cpp b/src/core/tools/renderdoc.cpp
+index 6a6df23..32f1063 100644
+--- a/src/core/tools/renderdoc.cpp
++++ b/src/core/tools/renderdoc.cpp
+@@ -12,7 +12,7 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+-#else
++#elif !defined(__SWITCH2__)
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -28,8 +28,8 @@ RenderdocAPI::RenderdocAPI() {
+             ASSERT(ret == 1);
+         }
+     }
+-#elif defined(__HAIKU__)
+-    // no rtld on haiku
++#elif defined(__HAIKU__) || defined(__SWITCH2__)
++    // no rtld on haiku (ni en Horizon)
+ #else
+ #ifdef __ANDROID__
+     static constexpr const char RENDERDOC_LIB[] = "libVkLayer_GLES_RenderDoc.so";
 diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
 index 72cc05e..ced7db8 100644
 --- a/src/dynarmic/src/dynarmic/CMakeLists.txt
