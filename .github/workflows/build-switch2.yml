@@ -36,12 +36,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ounce-devkit (libounce, OunceVK, libkaihen)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEVKIT_VERSION: "20261117"
+          DEVKIT_SHA256: 33cc5478324f8243dc801c3d4b8fe781885a306975f63937bd246ffdfd73cf79
         run: |
-          git clone --depth 1 https://github.com/ouncebrew/ounce-devkit /tmp/ounce-devkit
-          sh /tmp/ounce-devkit/install.sh
-          # Portlibs de Switch 1 que solo usan la libc y libnx (sirven en Switch 2).
-          dkp-pacman -S --needed --noconfirm switch-ffmpeg switch-pkg-config || true
-          ls $DEVKITPRO/portlibs/switch2/lib
+          # pkg.devkitpro.org bloquea a los runners de GitHub (403), así que no usamos
+          # dkp-pacman: instalamos el archivo publicado en las releases de ounce-devkit.
+          name="ounce-devkit-$DEVKIT_VERSION.tar.xz"
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/ouncebrew/ounce-devkit/releases?per_page=100" |
+                python3 -c "import json,sys; n=sys.argv[1]; print(next(a['browser_download_url'] for r in json.load(sys.stdin) for a in r['assets'] if a['name']==n))" "$name")
+          echo "Descargando $url"
+          curl -fsSL -o "/tmp/$name" "$url"
+          echo "$DEVKIT_SHA256  /tmp/$name" | sha256sum -c -
+          tar -xJf "/tmp/$name" -C "$DEVKITPRO"
+          cat "$DEVKITPRO/ounce-devkit-version.txt"
+          ls "$DEVKITPRO/portlibs/switch2/lib"
+          # ¿Qué portlibs de Switch 1 trae ya la imagen?
+          ls "$DEVKITPRO/portlibs/switch/lib" | head -100 || true
 
       - name: Caché de OpenSSL
         id: openssl-cache

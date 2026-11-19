@@ -50,6 +50,49 @@ index 194d315..6b80d98 100644
  
  # SPIRV Headers
  AddJsonPackage(spirv-headers)
+diff --git a/externals/ffmpeg/CMakeLists.txt b/externals/ffmpeg/CMakeLists.txt
+index f1bf099..5db35c5 100644
+--- a/externals/ffmpeg/CMakeLists.txt
++++ b/externals/ffmpeg/CMakeLists.txt
+@@ -35,7 +35,8 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
+     elseif (NOT (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES CMAKE_SYSTEM_PROCESSOR
+     AND CMAKE_HOST_SYSTEM_NAME MATCHES CMAKE_SYSTEM_NAME))
+         string(TOLOWER "${CMAKE_SYSTEM_NAME}" FFmpeg_SYSTEM_NAME)
+-        if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm")
++        if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm"
++            OR FFmpeg_SYSTEM_NAME STREQUAL "nintendoswitch")
+             set(FFmpeg_SYSTEM_NAME "none")
+         endif()
+         # TODO: Can we really do better? Auto-detection? Something clever?
+@@ -54,7 +55,7 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
+     endif()
+ endif()
+ 
+-if (OPENORBIS OR MANAGARM)
++if (OPENORBIS OR MANAGARM OR NINTENDO_SWITCH2)
+     # Doesn't support VA-API, don't go thru the embarrassment of trying to enable it
+     list(APPEND FFmpeg_HWACCEL_FLAGS --disable-vaapi)
+ elseif (ANDROID)
+@@ -178,6 +179,19 @@ elseif (MANAGARM)
+     )
+ endif()
+ 
++if (NINTENDO_SWITCH2)
++    # Switch 2 (libounce): las mismas opciones que switch2vars.sh, y libnx para que
++    # los programas de prueba del configure de FFmpeg enlacen.
++    list(APPEND FFmpeg_CROSS_COMPILE_FLAGS
++        "--extra-cflags=$ENV{CFLAGS} $ENV{CPPFLAGS}"
++        "--extra-cxxflags=$ENV{CXXFLAGS} $ENV{CPPFLAGS}"
++        "--extra-ldflags=-specs=${NX_ROOT}/switch.specs $ENV{LDFLAGS}"
++        "--extra-libs=-lnx"
++        --disable-network
++        --disable-asm
++    )
++endif()
++
+ if (YUZU_USE_BUNDLED_FFMPEG)
+     AddJsonPackage(ffmpeg-ci)
+ 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 305c744..7f10195 100644
 --- a/src/CMakeLists.txt
