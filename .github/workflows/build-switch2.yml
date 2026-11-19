@@ -74,8 +74,10 @@ jobs:
           else
             sh ci/build-openssl.sh 2>&1 | tee openssl.log
             mkdir -p openssl-prefix/lib openssl-prefix/include
-            cp -a $DEVKITPRO/portlibs/switch2/lib/libssl.a $DEVKITPRO/portlibs/switch2/lib/libcrypto.a openssl-prefix/lib/
+            cp -a $DEVKITPRO/portlibs/switch2/lib/libssl.a $DEVKITPRO/portlibs/switch2/lib/libcrypto.a \
+                  $DEVKITPRO/portlibs/switch2/lib/libdl.a openssl-prefix/lib/
             cp -a $DEVKITPRO/portlibs/switch2/lib/pkgconfig openssl-prefix/lib/ || true
+            cp -a $DEVKITPRO/portlibs/switch2/lib/cmake openssl-prefix/lib/ || true
             cp -a $DEVKITPRO/portlibs/switch2/include/openssl openssl-prefix/include/
           fi
 

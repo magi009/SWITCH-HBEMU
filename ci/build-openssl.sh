@@ -21,4 +21,13 @@ cd "$work/openssl"
 
 make -j"$(nproc)" build_libs
 make install_dev
+
+# El target linux-* de OpenSSL deja "-ldl" en su OpenSSLConfig.cmake y en los .pc;
+# Horizon no tiene libdl. Quitarlo, y por si otra cosa lo pide, una libdl.a vacía.
+find "$PORTLIBS_PREFIX/lib/cmake" "$PORTLIBS_PREFIX/lib/pkgconfig" -type f \
+     \( -name "*.cmake" -o -name "*.pc" \) 2>/dev/null |
+    xargs -r sed -i -e 's/[[:space:]]*-ldl\b//g' -e 's/;dl;/;/g' -e 's/"dl"//g'
+printf '' > "$work/empty.c"
+aarch64-none-elf-gcc -c "$work/empty.c" -o "$work/empty.o"
+aarch64-none-elf-ar rcs "$PORTLIBS_PREFIX/lib/libdl.a" "$work/empty.o"
 echo ">> OpenSSL $VERSION instalado en $PORTLIBS_PREFIX"
