@@ -1057,6 +1057,42 @@ index ee7a769..2515a51 100644
  };
  
  /**
+diff --git a/src/core/hle/service/bcat/news/builtin_news.cpp b/src/core/hle/service/bcat/news/builtin_news.cpp
+index 79fde93..8ae027a 100644
+--- a/src/core/hle/service/bcat/news/builtin_news.cpp
++++ b/src/core/hle/service/bcat/news/builtin_news.cpp
+@@ -290,6 +290,16 @@ static inline u64 ParseIsoTimestamp(const std::string& iso) {
+ 
+ #ifdef _WIN32
+     return static_cast<u64>(_mkgmtime(&tm));
++#elif defined(__SWITCH2__)
++    // newlib no tiene timegm: segundos desde 1970 en UTC (algoritmo days_from_civil).
++    const long long y = static_cast<long long>(tm.tm_year) + 1900 - (tm.tm_mon < 2 ? 1 : 0);
++    const long long era = (y >= 0 ? y : y - 399) / 400;
++    const long long yoe = y - era * 400;
++    const long long m = tm.tm_mon + 1;
++    const long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + tm.tm_mday - 1;
++    const long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    const long long days = era * 146097 + doe - 719468;
++    return static_cast<u64>(days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+ #else
+     return static_cast<u64>(timegm(&tm));
+ #endif
+diff --git a/src/core/internal_network/socket_proxy.cpp b/src/core/internal_network/socket_proxy.cpp
+index 744765b..7dc0e1a 100644
+--- a/src/core/internal_network/socket_proxy.cpp
++++ b/src/core/internal_network/socket_proxy.cpp
+@@ -14,8 +14,8 @@
+ #include "core/internal_network/socket_proxy.h"
+ #include "network/network.h"
+ 
+-#ifdef __unix__
+-#include <sys/socket.h>
++#if defined(__unix__) || defined(__SWITCH2__)
++#include <sys/socket.h> // en Switch 2, el de libounce (sockets BSD)
+ #endif
+ 
+ namespace Network {
 diff --git a/src/core/tools/renderdoc.cpp b/src/core/tools/renderdoc.cpp
 index 6a6df23..32f1063 100644
 --- a/src/core/tools/renderdoc.cpp
