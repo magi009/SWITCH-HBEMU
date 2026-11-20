@@ -1358,10 +1358,10 @@ index 755b05b..0af6999 100644
      // A IR::LocationDescriptor will have one current CodePtr.
 diff --git a/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
 new file mode 100644
-index 0000000..d33116b
+index 0000000..2c70934
 --- /dev/null
 +++ b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,100 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1371,12 +1371,23 @@ index 0000000..d33116b
 +
 +#include <algorithm>
 +#include <cstddef>
++#include <cstdio>
 +#include <new>
 +
 +#include <switch.h>
 +#include <kaihen.h>
 +
++extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
++
 +namespace Dynarmic::Backend::Arm64 {
++
++namespace {
++void Crumb(const char* text) {
++    if (eden_ounce_breadcrumb) {
++        eden_ounce_breadcrumb(text);
++    }
++}
++} // namespace
 +
 +static_assert(sizeof(HorizonCodeBlock::Range) == sizeof(KaihenJitRange));
 +static_assert(offsetof(HorizonCodeBlock::Range, offset) == offsetof(KaihenJitRange, offset));
@@ -1388,8 +1399,18 @@ index 0000000..d33116b
 +
 +HorizonCodeBlock::HorizonCodeBlock(std::size_t size)
 +        : m_impl{std::make_unique<Impl>()}, m_size{size} {
-+    if (R_FAILED(jitCreate(&m_impl->jit, size))) {
++    const Result rc = jitCreate(&m_impl->jit, size);
++    if (R_FAILED(rc)) {
++        char text[96];
++        std::snprintf(text, sizeof(text), "JIT kaiHEN: jitCreate(%zu MiB) falló, Result 0x%X",
++                      size >> 20, rc);
++        Crumb(text);
 +        throw std::bad_alloc{};
++    }
++    {
++        char text[96];
++        std::snprintf(text, sizeof(text), "JIT kaiHEN: bloque de %zu MiB creado", size >> 20);
++        Crumb(text);
 +    }
 +    m_w = static_cast<std::uint32_t*>(jitGetRwAddr(&m_impl->jit));
 +    m_x = static_cast<std::uint32_t*>(jitGetRxAddr(&m_impl->jit));
@@ -1426,6 +1447,11 @@ index 0000000..d33116b
 +    }
 +    m_dirty.resize(out + 1);
 +
++    static bool first_publish = true;
++    if (first_publish) {
++        first_publish = false;
++        Crumb("JIT kaiHEN: primera publicación de código");
++    }
 +    const Result rc = kaihenJitPublishRanges(
 +        &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
 +    if (R_FAILED(rc)) {
@@ -1832,10 +1858,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..1511fcf
+index 0000000..bb6d268
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,283 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1940,6 +1966,11 @@ index 0000000..1511fcf
 +} // namespace
 +
 +extern "C" {
++// Para código fuera del frontend (Dynarmic): mismas migas de pan, sin headers de libnx.
++void eden_ounce_breadcrumb(const char* text) {
++    Ounce::Hos::Breadcrumb(text);
++}
++
 +[[noreturn]] void __real_abort(void);
 +void __real___assert_func(const char* file, int line, const char* func, const char* expr);
 +[[noreturn]] void __real_diagAbortWithResult(Result res);
@@ -2001,6 +2032,23 @@ index 0000000..1511fcf
 +    FILE* f = std::fopen(kCrashPath, "a");
 +    if (f) {
 +        std::fprintf(f, "--- sesión iniciada (t=%ld) ---\n", static_cast<long>(std::time(nullptr)));
++        std::fclose(f);
++    }
++    // Prueba del handler: si existe este archivo, se borra y se provoca un fallo a propósito.
++    // Sirve para comprobar que, bajo KaiHEN, los fallos de CPU llegan a crash.txt.
++    constexpr const char* kTestCrash = "sdmc:/switch/eden/test_crash.txt";
++    if (FILE* t = std::fopen(kTestCrash, "r")) {
++        std::fclose(t);
++        std::remove(kTestCrash);
++        Breadcrumb("prueba de fallo: escribiendo en la dirección 0");
++        *static_cast<volatile int*>(nullptr) = 0x1234;
++    }
++}
++
++void Breadcrumb(const char* text) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "[%10.3f] %s\n", static_cast<double>(MonotonicNs()) / 1e9, text);
 +        std::fclose(f);
 +    }
 +}
@@ -2099,10 +2147,10 @@ index 0000000..1511fcf
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
 new file mode 100644
-index 0000000..c871b33
+index 0000000..2b7804e
 --- /dev/null
 +++ b/src/eden_ounce/horizon.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,79 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2143,6 +2191,9 @@ index 0000000..c871b33
 +void InstallCrashHandler();
 +/// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
 +void WriteCrashNote(const char* text);
++/// Migas de pan: una línea con marca de tiempo en crash.txt, escrita al instante (sin el
++/// hilo del log de Eden), para saber hasta dónde llegó el arranque si el proceso muere.
++void Breadcrumb(const char* text);
 +
 +// ------------------------------------------------------------------ vídeo
 +void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).
@@ -2303,10 +2354,10 @@ index 0000000..f883d4e
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..6b51eed
+index 0000000..5bd5c52
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,243 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2328,6 +2379,7 @@ index 0000000..6b51eed
 +#include <exception>
 +#include <cstdio>
 +#include <filesystem>
++#include <format>
 +#include <string>
 +#include <system_error>
 +#include <vector>
@@ -2466,6 +2518,7 @@ index 0000000..6b51eed
 +        }
 +    }
 +    LOG_INFO(Frontend, "Juego: {}", filepath);
++    Ounce::Hos::Breadcrumb("juego elegido");
 +
 +    ConfigureForSwitch2();
 +
@@ -2474,6 +2527,7 @@ index 0000000..6b51eed
 +
 +    system.Initialize();
 +    system.ApplySettings();
++    Ounce::Hos::Breadcrumb("Core::System inicializado");
 +
 +    auto window = std::make_unique<EdenOunce::EmuWindowOunce>(input_subsystem, system);
 +
@@ -2485,7 +2539,9 @@ index 0000000..6b51eed
 +    Service::AM::FrontendAppletParameters load_parameters{
 +        .applet_id = Service::AM::AppletId::Application,
 +    };
++    Ounce::Hos::Breadcrumb("cargando juego (incluye crear el renderer Vulkan)");
 +    const Core::SystemResultStatus load_result = system.Load(*window, filepath, load_parameters);
++    Ounce::Hos::Breadcrumb("system.Load terminado");
 +    if (load_result != Core::SystemResultStatus::Success) {
 +        const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
 +        std::string description = "Error de carga";
@@ -2500,7 +2556,9 @@ index 0000000..6b51eed
 +    }
 +
 +    system.GPU().Start();
++    Ounce::Hos::Breadcrumb("GPU iniciada");
 +    system.GetCpuManager().OnGpuReady();
++    Ounce::Hos::Breadcrumb("CpuManager listo");
 +
 +    if (Settings::values.use_disk_shader_cache.GetValue()) {
 +        system.Renderer().ReadRasterizer()->LoadDiskResources(
@@ -2508,15 +2566,26 @@ index 0000000..6b51eed
 +            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
 +    }
 +
-+    system.RegisterExitCallback([&window] { window->RequestClose(); });
++    Ounce::Hos::Breadcrumb("caché de shaders leída");
++    system.RegisterExitCallback([&window] {
++        Ounce::Hos::Breadcrumb("el juego pidió salir");
++        window->RequestClose();
++    });
 +
 +    void(system.Run());
++    Ounce::Hos::Breadcrumb("emulación en marcha (system.Run)");
 +
 +    // El emulador corre en sus propios hilos (núcleos de CPU, GPU, servicios);
 +    // este hilo solo bombea entrada y eventos del applet.
++    u64 loops = 0;
 +    while (window->PumpEvents()) {
 +        Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
++        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo
++            const std::string beat = std::format("latido {} s", loops / 250);
++            Ounce::Hos::Breadcrumb(beat.c_str());
++        }
 +    }
++    Ounce::Hos::Breadcrumb("saliendo del bucle principal");
 +
 +    if (system.IsPoweredOn()) {
 +        system.Pause();

@@ -38,6 +38,9 @@ std::uint64_t MonotonicNs();
 void InstallCrashHandler();
 /// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
 void WriteCrashNote(const char* text);
+/// Migas de pan: una línea con marca de tiempo en crash.txt, escrita al instante (sin el
+/// hilo del log de Eden), para saber hasta dónde llegó el arranque si el proceso muere.
+void Breadcrumb(const char* text);
 
 // ------------------------------------------------------------------ vídeo
 void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).

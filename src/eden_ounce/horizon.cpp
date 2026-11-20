@@ -102,6 +102,11 @@ void NoteSilentExit(const char* what, const char* detail) {
 } // namespace
 
 extern "C" {
+// Para código fuera del frontend (Dynarmic): mismas migas de pan, sin headers de libnx.
+void eden_ounce_breadcrumb(const char* text) {
+    Ounce::Hos::Breadcrumb(text);
+}
+
 [[noreturn]] void __real_abort(void);
 void __real___assert_func(const char* file, int line, const char* func, const char* expr);
 [[noreturn]] void __real_diagAbortWithResult(Result res);
@@ -163,6 +168,23 @@ void InstallCrashHandler() {
     FILE* f = std::fopen(kCrashPath, "a");
     if (f) {
         std::fprintf(f, "--- sesión iniciada (t=%ld) ---\n", static_cast<long>(std::time(nullptr)));
+        std::fclose(f);
+    }
+    // Prueba del handler: si existe este archivo, se borra y se provoca un fallo a propósito.
+    // Sirve para comprobar que, bajo KaiHEN, los fallos de CPU llegan a crash.txt.
+    constexpr const char* kTestCrash = "sdmc:/switch/eden/test_crash.txt";
+    if (FILE* t = std::fopen(kTestCrash, "r")) {
+        std::fclose(t);
+        std::remove(kTestCrash);
+        Breadcrumb("prueba de fallo: escribiendo en la dirección 0");
+        *static_cast<volatile int*>(nullptr) = 0x1234;
+    }
+}
+
+void Breadcrumb(const char* text) {
+    FILE* f = std::fopen(kCrashPath, "a");
+    if (f) {
+        std::fprintf(f, "[%10.3f] %s\n", static_cast<double>(MonotonicNs()) / 1e9, text);
         std::fclose(f);
     }
 }

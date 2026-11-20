@@ -19,6 +19,7 @@
 #include <exception>
 #include <cstdio>
 #include <filesystem>
+#include <format>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -157,6 +158,7 @@ int RunEmulator(int argc, char** argv) {
         }
     }
     LOG_INFO(Frontend, "Juego: {}", filepath);
+    Ounce::Hos::Breadcrumb("juego elegido");
 
     ConfigureForSwitch2();
 
@@ -165,6 +167,7 @@ int RunEmulator(int argc, char** argv) {
 
     system.Initialize();
     system.ApplySettings();
+    Ounce::Hos::Breadcrumb("Core::System inicializado");
 
     auto window = std::make_unique<EdenOunce::EmuWindowOunce>(input_subsystem, system);
 
@@ -176,7 +179,9 @@ int RunEmulator(int argc, char** argv) {
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
     };
+    Ounce::Hos::Breadcrumb("cargando juego (incluye crear el renderer Vulkan)");
     const Core::SystemResultStatus load_result = system.Load(*window, filepath, load_parameters);
+    Ounce::Hos::Breadcrumb("system.Load terminado");
     if (load_result != Core::SystemResultStatus::Success) {
         const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
         std::string description = "Error de carga";
@@ -191,7 +196,9 @@ int RunEmulator(int argc, char** argv) {
     }
 
     system.GPU().Start();
+    Ounce::Hos::Breadcrumb("GPU iniciada");
     system.GetCpuManager().OnGpuReady();
+    Ounce::Hos::Breadcrumb("CpuManager listo");
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         system.Renderer().ReadRasterizer()->LoadDiskResources(
@@ -199,15 +206,26 @@ int RunEmulator(int argc, char** argv) {
             [](VideoCore::LoadCallbackStage, size_t, size_t) {});
     }
 
-    system.RegisterExitCallback([&window] { window->RequestClose(); });
+    Ounce::Hos::Breadcrumb("caché de shaders leída");
+    system.RegisterExitCallback([&window] {
+        Ounce::Hos::Breadcrumb("el juego pidió salir");
+        window->RequestClose();
+    });
 
     void(system.Run());
+    Ounce::Hos::Breadcrumb("emulación en marcha (system.Run)");
 
     // El emulador corre en sus propios hilos (núcleos de CPU, GPU, servicios);
     // este hilo solo bombea entrada y eventos del applet.
+    u64 loops = 0;
     while (window->PumpEvents()) {
         Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
+        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo
+            const std::string beat = std::format("latido {} s", loops / 250);
+            Ounce::Hos::Breadcrumb(beat.c_str());
+        }
     }
+    Ounce::Hos::Breadcrumb("saliendo del bucle principal");
 
     if (system.IsPoweredOn()) {
         system.Pause();

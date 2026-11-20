@@ -7,12 +7,23 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <new>
 
 #include <switch.h>
 #include <kaihen.h>
 
+extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
+
 namespace Dynarmic::Backend::Arm64 {
+
+namespace {
+void Crumb(const char* text) {
+    if (eden_ounce_breadcrumb) {
+        eden_ounce_breadcrumb(text);
+    }
+}
+} // namespace
 
 static_assert(sizeof(HorizonCodeBlock::Range) == sizeof(KaihenJitRange));
 static_assert(offsetof(HorizonCodeBlock::Range, offset) == offsetof(KaihenJitRange, offset));
@@ -24,8 +35,18 @@ struct HorizonCodeBlock::Impl {
 
 HorizonCodeBlock::HorizonCodeBlock(std::size_t size)
         : m_impl{std::make_unique<Impl>()}, m_size{size} {
-    if (R_FAILED(jitCreate(&m_impl->jit, size))) {
+    const Result rc = jitCreate(&m_impl->jit, size);
+    if (R_FAILED(rc)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "JIT kaiHEN: jitCreate(%zu MiB) falló, Result 0x%X",
+                      size >> 20, rc);
+        Crumb(text);
         throw std::bad_alloc{};
+    }
+    {
+        char text[96];
+        std::snprintf(text, sizeof(text), "JIT kaiHEN: bloque de %zu MiB creado", size >> 20);
+        Crumb(text);
     }
     m_w = static_cast<std::uint32_t*>(jitGetRwAddr(&m_impl->jit));
     m_x = static_cast<std::uint32_t*>(jitGetRxAddr(&m_impl->jit));
@@ -62,6 +83,11 @@ void HorizonCodeBlock::Publish() {
     }
     m_dirty.resize(out + 1);
 
+    static bool first_publish = true;
+    if (first_publish) {
+        first_publish = false;
+        Crumb("JIT kaiHEN: primera publicación de código");
+    }
     const Result rc = kaihenJitPublishRanges(
         &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
     if (R_FAILED(rc)) {
