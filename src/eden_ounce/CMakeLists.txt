@@ -30,6 +30,9 @@ target_link_libraries(eden-ounce PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 # kaihenJitPublishRanges; debe ir antes de libounce (-lnx) en la línea de enlace.
 target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
 
+# Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
+target_link_libraries(eden-ounce PRIVATE -lz)
+
 nx_generate_nacp(eden-ounce.nacp
     NAME    "Eden"
     AUTHOR  "Eden Emulator Project (port Ounce)"

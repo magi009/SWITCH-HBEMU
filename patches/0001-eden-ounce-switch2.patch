@@ -1581,10 +1581,10 @@ index 7833b65..d63cf87 100644
  }  // namespace Dynarmic
 diff --git a/src/eden_ounce/CMakeLists.txt b/src/eden_ounce/CMakeLists.txt
 new file mode 100644
-index 0000000..f70c16b
+index 0000000..feb9688
 --- /dev/null
 +++ b/src/eden_ounce/CMakeLists.txt
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,45 @@
 +# SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1616,6 +1616,9 @@ index 0000000..f70c16b
 +# libkaihen aporta el proveedor del JIT (kaihen-jit.o) que usan jitCreate/
 +# kaihenJitPublishRanges; debe ir antes de libounce (-lnx) en la línea de enlace.
 +target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
++
++# Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
++target_link_libraries(eden-ounce PRIVATE -lz)
 +
 +nx_generate_nacp(eden-ounce.nacp
 +    NAME    "Eden"
@@ -2540,16 +2543,18 @@ index 0000000..03021e0
 +
 +} // namespace InputCommon::CemuhookUDP
 diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
-index 64d14ab..d0b14fe 100644
+index 64d14ab..ba0dc23 100644
 --- a/src/video_core/CMakeLists.txt
 +++ b/src/video_core/CMakeLists.txt
-@@ -418,6 +418,10 @@ endif()
+@@ -418,6 +418,12 @@ endif()
  target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
  
  target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
 +if (NINTENDO_SWITCH2)
 +    # FFmpeg de los portlibs es estático: sus dependencias privadas (dav1d, zlib) van detrás.
-+    target_link_libraries(video_core PRIVATE dav1d ZLIB::ZLIB)
++    # "-lz" como opción cruda: CMake no la funde con el libz.a que ya salió antes en la
++    # línea (antes de libavcodec), así que queda detrás y resuelve uncompress().
++    target_link_libraries(video_core PRIVATE dav1d -lz)
 +endif()
  target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
  
