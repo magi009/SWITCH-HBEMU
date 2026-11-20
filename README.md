@@ -101,18 +101,16 @@ export DEVKITPRO=/opt/devkitpro
 
 ## Lo que falta, por orden
 
-**Fase 0: que enlace (casi lista).** El CI (`.github/workflows/build-switch2.yml`)
-compila con devkitA64 GCC 15.2 + ounce-devkit 20261117:
+**Fase 0: compilar y enlazar (hecha).** El CI (`.github/workflows/build-switch2.yml`)
+genera `eden.nro` (~40 MB) con devkitA64 GCC 15.2 + ounce-devkit 20261117. Puedes
+descargarlo desde los artefactos de cada ejecución en la pestaña **Actions**.
 
-- Hecho: OpenSSL 3.6.2 para Switch 2 (`ci/build-openssl.sh`); FFmpeg, zstd, lz4 y
-  Opus de los portlibs o de CPM; Boost sin Process ni Filesystem.
-- Hecho: los ~2.400 archivos de Eden compilan. Se quitaron o vaciaron el
-  depurador GDB, HTTP (hydrocarbon), el cliente UDP de mandos, renderdoc y
-  `signal_chain`.
-- Pendiente: confirmar que el enlace final de `eden.nro` pasa. El último run se cayó
-  solo por símbolos (dav1d, zlib, `pipe`), y ya están arreglados.
-
-Puede que aparezcan más funciones POSIX que newlib no tiene al probar en la consola.
+- OpenSSL 3.6.2 se compila para Switch 2 (`ci/build-openssl.sh`). FFmpeg, dav1d, zlib
+  y zstd salen de los portlibs de la imagen de devkitPro, y el resto de las
+  dependencias, de CPM.
+- En Switch 2 se quitaron o quedaron vacíos el depurador GDB, HTTP (hydrocarbon), el
+  cliente UDP de mandos, renderdoc y `signal_chain`.
+- Nada de esto se ha probado todavía en la consola.
 
 **Fase 1: arrancar homebrew.** Probar primero con `.nro` caseros (más fácil de depurar
 que un juego comercial). Medir el coste por IPC de `kaihenJitPublishRanges`. Si es alto,
