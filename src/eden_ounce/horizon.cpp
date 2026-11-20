@@ -182,9 +182,14 @@ void InstallCrashHandler() {
 }
 
 void Breadcrumb(const char* text) {
+    u64 used = 0;
+    u64 total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
     FILE* f = std::fopen(kCrashPath, "a");
     if (f) {
-        std::fprintf(f, "[%10.3f] %s\n", static_cast<double>(MonotonicNs()) / 1e9, text);
+        std::fprintf(f, "[%10.3f] (mem %lu/%lu MiB) %s\n",
+                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
         std::fclose(f);
     }
 }

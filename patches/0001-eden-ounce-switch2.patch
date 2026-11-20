@@ -414,6 +414,33 @@ index e8a27a1..1d2e790 100644
  }
  
  } // namespace Common::FS
+diff --git a/src/common/horizon/breadcrumb.h b/src/common/horizon/breadcrumb.h
+new file mode 100644
+index 0000000..c170631
+--- /dev/null
++++ b/src/common/horizon/breadcrumb.h
+@@ -0,0 +1,21 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Migas de pan para depurar el arranque en Switch 2 (ver eden_ounce/horizon.cpp).
++// En Horizon/KaiHEN los fallos de CPU no llegan al proceso, así que la única forma de
++// saber dónde muere es dejar una línea escrita al instante antes de cada paso.
++// Fuera de Switch 2 no hace nada.
++
++#pragma once
++
++#ifdef __SWITCH2__
++extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
++#define EDEN_CRUMB(text)                                                                           \
++    do {                                                                                           \
++        if (eden_ounce_breadcrumb) {                                                               \
++            eden_ounce_breadcrumb(text);                                                           \
++        }                                                                                          \
++    } while (0)
++#else
++#define EDEN_CRUMB(text) ((void)0)
++#endif
 diff --git a/src/common/horizon/horizon_os.cpp b/src/common/horizon/horizon_os.cpp
 new file mode 100644
 index 0000000..c6f3073
@@ -1013,6 +1040,80 @@ index b4d18d3..f91577e 100644
      config.code_cache_size = std::uint32_t(128_MiB);
  #else
      config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index f954fee..bb08768 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -18,6 +18,7 @@
+ #include "common/string_util.h"
+ #include "core/arm/exclusive_monitor.h"
+ #include "core/core.h"
++#include "common/horizon/breadcrumb.h"
+ 
+ #include "launch_timestamp_cache.h"
+ #include "core/core_timing.h"
+@@ -274,15 +275,20 @@ struct System::Impl {
+     }
+ 
+     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
++        EDEN_CRUMB("Setup: host1x");
+         host1x_core.emplace(system);
++        EDEN_CRUMB("Setup: creando GPU (renderer Vulkan)");
+         VideoCore::CreateGPU(gpu_core, emu_window, system);
+         if (!gpu_core)
+             return SystemResultStatus::ErrorVideoCore;
+ 
++        EDEN_CRUMB("Setup: audio_core");
+         audio_core.emplace(system);
+ 
++        EDEN_CRUMB("Setup: servicios HLE");
+         service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
+         services.emplace(service_manager, system, stop_event.get_token());
++        EDEN_CRUMB("Setup: servicios HLE listos");
+ 
+         is_powered_on = true;
+         exit_locked = false;
+@@ -302,6 +308,7 @@ struct System::Impl {
+             fs_controller.InitTempStorage();
+         }
+ 
++        EDEN_CRUMB("Load: kernel");
+         InitializeKernel(system);
+ 
+         if (params.applet_type == Service::AM::AppletType::Application) {
+@@ -313,7 +320,9 @@ struct System::Impl {
+         // Create the application process
+         Loader::ResultStatus load_result{};
+         std::vector<u8> control;
++        EDEN_CRUMB("Load: creando proceso del juego");
+         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
++        EDEN_CRUMB("Load: proceso creado");
+         if (load_result != Loader::ResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+             ShutdownMainProcess();
+@@ -353,11 +362,14 @@ struct System::Impl {
+             return init_result;
+         }
+         // Waiting for GPU before initializing CPU
++        EDEN_CRUMB("Load: CpuManager::Initialize (hilos de CPU)");
+         cpu_manager.Initialize();
+ 
+         // Register with applet manager
+         // All threads are started, begin main process execution, now that we're in the clear
++        EDEN_CRUMB("Load: applet manager");
+         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
++        EDEN_CRUMB("Load: applet registrado");
+ 
+         if (Settings::values.gamecard_inserted) {
+             if (Settings::values.gamecard_current_game) {
+@@ -381,6 +393,7 @@ struct System::Impl {
+             LOG_ERROR(Core, "Failed to find program id for ROM");
+         }
+ 
++        EDEN_CRUMB("Load: ajustes por juego");
+         GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
+         if (auto room_member = Network::GetRoomMember().lock()) {
+             Network::GameInfo game_info;
 diff --git a/src/core/debugger/debugger.cpp b/src/core/debugger/debugger.cpp
 index 7c887ad..8b9f1d9 100644
 --- a/src/core/debugger/debugger.cpp
@@ -1858,10 +1959,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..bb6d268
+index 0000000..23a9949
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,288 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2046,9 +2147,14 @@ index 0000000..bb6d268
 +}
 +
 +void Breadcrumb(const char* text) {
++    u64 used = 0;
++    u64 total = 0;
++    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
 +    FILE* f = std::fopen(kCrashPath, "a");
 +    if (f) {
-+        std::fprintf(f, "[%10.3f] %s\n", static_cast<double>(MonotonicNs()) / 1e9, text);
++        std::fprintf(f, "[%10.3f] (mem %lu/%lu MiB) %s\n",
++                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
 +        std::fclose(f);
 +    }
 +}
