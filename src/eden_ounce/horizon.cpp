@@ -3,9 +3,76 @@
 
 // Implementación de horizon.h. Este archivo incluye <switch.h> y NINGÚN header de Eden.
 
+#include <cstdio>
+#include <ctime>
+
 #include <switch.h>
 
 #include "eden_ounce/horizon.h"
+
+// ---------------------------------------------------------------- fallos de CPU
+// libnx llama a __libnx_exception_handler (en su propia pila) cuando un hilo de este
+// proceso provoca una excepción de CPU. Escribimos lo esencial y dejamos que el
+// proceso termine (vuelve al hbmenu).
+extern "C" {
+alignas(16) u8 __nx_exception_stack[0x8000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+extern char __start__; // base de eden.nro (crt0 de libnx)
+}
+
+namespace {
+constexpr const char* kCrashPath = "sdmc:/switch/eden/log/crash.txt";
+
+const char* DescribeException(u32 desc) {
+    switch (desc) {
+    case ThreadExceptionDesc_InstructionAbort: return "InstructionAbort";
+    case ThreadExceptionDesc_MisalignedPC: return "MisalignedPC";
+    case ThreadExceptionDesc_MisalignedSP: return "MisalignedSP";
+    case ThreadExceptionDesc_SError: return "SError";
+    case ThreadExceptionDesc_BadSVC: return "BadSVC";
+    case ThreadExceptionDesc_Trap: return "Trap (instrucción ilegal / brk)";
+    case ThreadExceptionDesc_Other: return "Other (data abort u otro)";
+    default: return "?";
+    }
+}
+} // namespace
+
+extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    FILE* f = std::fopen(kCrashPath, "a");
+    if (!f) {
+        return;
+    }
+    const u64 base = reinterpret_cast<u64>(&__start__);
+    const auto off = [base](u64 a) { return a >= base ? a - base : 0; };
+    std::fprintf(f, "=== Fallo de CPU (%s, desc=0x%X) ===\n", DescribeException(ctx->error_desc),
+                 ctx->error_desc);
+    std::fprintf(f, "base eden.nro = 0x%016lX\n", base);
+    std::fprintf(f, "PC  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->pc.x, off(ctx->pc.x));
+    std::fprintf(f, "LR  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->lr.x, off(ctx->lr.x));
+    std::fprintf(f, "SP  = 0x%016lX  FP = 0x%016lX\n", ctx->sp.x, ctx->fp.x);
+    std::fprintf(f, "FAR = 0x%016lX  ESR = 0x%08X  PSTATE = 0x%08X\n", ctx->far.x, ctx->esr,
+                 ctx->pstate);
+    for (int i = 0; i < 29; ++i) {
+        std::fprintf(f, "X%-2d = 0x%016lX%s", i, ctx->cpu_gprs[i].x, (i % 2) ? "\n" : "   ");
+    }
+    // Pila de llamadas siguiendo los frame pointers (solo dentro de eden.nro).
+    std::fprintf(f, "\nLlamadas:\n");
+    u64 fp = ctx->fp.x;
+    for (int depth = 0; depth < 32 && fp != 0 && (fp & 0xF) == 0; ++depth) {
+        const u64* frame = reinterpret_cast<const u64*>(fp);
+        const u64 ret = frame[1];
+        if (ret < base) {
+            break;
+        }
+        std::fprintf(f, "  #%02d eden.nro+0x%lX\n", depth, off(ret));
+        if (frame[0] <= fp) {
+            break;
+        }
+        fp = frame[0];
+    }
+    std::fprintf(f, "\n");
+    std::fclose(f);
+}
 
 namespace Ounce::Hos {
 
@@ -18,6 +85,23 @@ static_assert(Button::Plus == HidNpadButton_Plus && Button::Minus == HidNpadButt
 static_assert(Button::Left == HidNpadButton_Left && Button::Up == HidNpadButton_Up);
 static_assert(Button::Right == HidNpadButton_Right && Button::Down == HidNpadButton_Down);
 static_assert(Button::AnySL == HidNpadButton_AnySL && Button::AnySR == HidNpadButton_AnySR);
+
+void InstallCrashHandler() {
+    // El handler ya está enlazado (símbolo fuerte); aquí solo dejamos una marca de sesión.
+    FILE* f = std::fopen(kCrashPath, "a");
+    if (f) {
+        std::fprintf(f, "--- sesión iniciada (t=%ld) ---\n", static_cast<long>(std::time(nullptr)));
+        std::fclose(f);
+    }
+}
+
+void WriteCrashNote(const char* text) {
+    FILE* f = std::fopen(kCrashPath, "a");
+    if (f) {
+        std::fprintf(f, "%s\n", text);
+        std::fclose(f);
+    }
+}
 
 void SetNoSuspend() {
     appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);

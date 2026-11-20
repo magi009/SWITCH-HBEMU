@@ -1826,18 +1826,85 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..865e6ff
+index 0000000..573839c
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,189 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +// Implementación de horizon.h. Este archivo incluye <switch.h> y NINGÚN header de Eden.
 +
++#include <cstdio>
++#include <ctime>
++
 +#include <switch.h>
 +
 +#include "eden_ounce/horizon.h"
++
++// ---------------------------------------------------------------- fallos de CPU
++// libnx llama a __libnx_exception_handler (en su propia pila) cuando un hilo de este
++// proceso provoca una excepción de CPU. Escribimos lo esencial y dejamos que el
++// proceso termine (vuelve al hbmenu).
++extern "C" {
++alignas(16) u8 __nx_exception_stack[0x8000];
++u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
++extern char __start__; // base de eden.nro (crt0 de libnx)
++}
++
++namespace {
++constexpr const char* kCrashPath = "sdmc:/switch/eden/log/crash.txt";
++
++const char* DescribeException(u32 desc) {
++    switch (desc) {
++    case ThreadExceptionDesc_InstructionAbort: return "InstructionAbort";
++    case ThreadExceptionDesc_MisalignedPC: return "MisalignedPC";
++    case ThreadExceptionDesc_MisalignedSP: return "MisalignedSP";
++    case ThreadExceptionDesc_SError: return "SError";
++    case ThreadExceptionDesc_BadSVC: return "BadSVC";
++    case ThreadExceptionDesc_Trap: return "Trap (instrucción ilegal / brk)";
++    case ThreadExceptionDesc_Other: return "Other (data abort u otro)";
++    default: return "?";
++    }
++}
++} // namespace
++
++extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (!f) {
++        return;
++    }
++    const u64 base = reinterpret_cast<u64>(&__start__);
++    const auto off = [base](u64 a) { return a >= base ? a - base : 0; };
++    std::fprintf(f, "=== Fallo de CPU (%s, desc=0x%X) ===\n", DescribeException(ctx->error_desc),
++                 ctx->error_desc);
++    std::fprintf(f, "base eden.nro = 0x%016lX\n", base);
++    std::fprintf(f, "PC  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->pc.x, off(ctx->pc.x));
++    std::fprintf(f, "LR  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->lr.x, off(ctx->lr.x));
++    std::fprintf(f, "SP  = 0x%016lX  FP = 0x%016lX\n", ctx->sp.x, ctx->fp.x);
++    std::fprintf(f, "FAR = 0x%016lX  ESR = 0x%08X  PSTATE = 0x%08X\n", ctx->far.x, ctx->esr,
++                 ctx->pstate);
++    for (int i = 0; i < 29; ++i) {
++        std::fprintf(f, "X%-2d = 0x%016lX%s", i, ctx->cpu_gprs[i].x, (i % 2) ? "\n" : "   ");
++    }
++    // Pila de llamadas siguiendo los frame pointers (solo dentro de eden.nro).
++    std::fprintf(f, "\nLlamadas:\n");
++    u64 fp = ctx->fp.x;
++    for (int depth = 0; depth < 32 && fp != 0 && (fp & 0xF) == 0; ++depth) {
++        const u64* frame = reinterpret_cast<const u64*>(fp);
++        const u64 ret = frame[1];
++        if (ret < base) {
++            break;
++        }
++        std::fprintf(f, "  #%02d eden.nro+0x%lX\n", depth, off(ret));
++        if (frame[0] <= fp) {
++            break;
++        }
++        fp = frame[0];
++    }
++    std::fprintf(f, "\n");
++    std::fclose(f);
++}
 +
 +namespace Ounce::Hos {
 +
@@ -1850,6 +1917,23 @@ index 0000000..865e6ff
 +static_assert(Button::Left == HidNpadButton_Left && Button::Up == HidNpadButton_Up);
 +static_assert(Button::Right == HidNpadButton_Right && Button::Down == HidNpadButton_Down);
 +static_assert(Button::AnySL == HidNpadButton_AnySL && Button::AnySR == HidNpadButton_AnySR);
++
++void InstallCrashHandler() {
++    // El handler ya está enlazado (símbolo fuerte); aquí solo dejamos una marca de sesión.
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "--- sesión iniciada (t=%ld) ---\n", static_cast<long>(std::time(nullptr)));
++        std::fclose(f);
++    }
++}
++
++void WriteCrashNote(const char* text) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "%s\n", text);
++        std::fclose(f);
++    }
++}
 +
 +void SetNoSuspend() {
 +    appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
@@ -1937,10 +2021,10 @@ index 0000000..865e6ff
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
 new file mode 100644
-index 0000000..d89e2e5
+index 0000000..c871b33
 --- /dev/null
 +++ b/src/eden_ounce/horizon.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,76 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1973,6 +2057,14 @@ index 0000000..d89e2e5
 +bool InitNetwork();
 +void ExitNetwork();
 +std::uint64_t MonotonicNs();
++
++// ------------------------------------------------------------------ fallos
++/// Archivo donde se escriben los fallos (sdmc:/switch/eden/log/crash.txt).
++/// Un fallo de CPU (acceso inválido, instrucción ilegal...) se escribe solo, con
++/// PC/LR/FAR como desplazamiento dentro de eden.nro, para ubicarlo con addr2line.
++void InstallCrashHandler();
++/// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
++void WriteCrashNote(const char* text);
 +
 +// ------------------------------------------------------------------ vídeo
 +void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).
@@ -2133,10 +2225,10 @@ index 0000000..f883d4e
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..dc27a13
+index 0000000..ecb70c2
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,176 @@
+@@ -0,0 +1,222 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2154,6 +2246,8 @@ index 0000000..dc27a13
 +
 +#include <algorithm>
 +#include <cctype>
++#include <cstdlib>
++#include <exception>
 +#include <cstdio>
 +#include <filesystem>
 +#include <string>
@@ -2224,7 +2318,49 @@ index 0000000..dc27a13
 +
 +} // namespace
 +
++namespace {
++
++/// Cualquier excepción de C++ sin atrapar (en cualquier hilo) termina aquí: dejar
++/// constancia en el log y en crash.txt antes de abortar, para no volver al hbmenu a ciegas.
++[[noreturn]] void OnTerminate() {
++    std::string reason = "std::terminate sin excepción activa";
++    if (const auto ex = std::current_exception()) {
++        try {
++            std::rethrow_exception(ex);
++        } catch (const std::exception& e) {
++            reason = std::string{"Excepción sin atrapar: "} + e.what();
++        } catch (...) {
++            reason = "Excepción sin atrapar (tipo desconocido)";
++        }
++    }
++    LOG_CRITICAL(Frontend, "{}", reason);
++    Common::Log::Stop(); // vacía el log a la SD
++    Ounce::Hos::WriteCrashNote(reason.c_str());
++    std::abort();
++}
++
++int RunEmulator(int argc, char** argv);
++
++} // namespace
++
 +int main(int argc, char** argv) {
++    Ounce::Hos::InstallCrashHandler();
++    std::set_terminate(OnTerminate);
++    try {
++        return RunEmulator(argc, argv);
++    } catch (const std::exception& e) {
++        const std::string reason = std::string{"Excepción: "} + e.what();
++        LOG_CRITICAL(Frontend, "{}", reason);
++        Common::Log::Stop();
++        Ounce::Hos::WriteCrashNote(reason.c_str());
++        Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
++        return 1;
++    }
++}
++
++namespace {
++
++int RunEmulator(int argc, char** argv) {
 +    // Que el juego emulado no se pause si el usuario abre el menu HOME un instante.
 +    Ounce::Hos::SetNoSuspend();
 +
@@ -2310,6 +2446,8 @@ index 0000000..dc27a13
 +    LOG_INFO(Frontend, "eden-ounce cerrado");
 +    return 0;
 +}
++
++} // namespace
 +
 +#define VMA_IMPLEMENTATION
 +#include "video_core/vulkan_common/vma.h"

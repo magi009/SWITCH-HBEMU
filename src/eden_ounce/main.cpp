@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <exception>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -85,7 +87,49 @@ bool CheckKeys(std::string& error) {
 
 } // namespace
 
+namespace {
+
+/// Cualquier excepción de C++ sin atrapar (en cualquier hilo) termina aquí: dejar
+/// constancia en el log y en crash.txt antes de abortar, para no volver al hbmenu a ciegas.
+[[noreturn]] void OnTerminate() {
+    std::string reason = "std::terminate sin excepción activa";
+    if (const auto ex = std::current_exception()) {
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            reason = std::string{"Excepción sin atrapar: "} + e.what();
+        } catch (...) {
+            reason = "Excepción sin atrapar (tipo desconocido)";
+        }
+    }
+    LOG_CRITICAL(Frontend, "{}", reason);
+    Common::Log::Stop(); // vacía el log a la SD
+    Ounce::Hos::WriteCrashNote(reason.c_str());
+    std::abort();
+}
+
+int RunEmulator(int argc, char** argv);
+
+} // namespace
+
 int main(int argc, char** argv) {
+    Ounce::Hos::InstallCrashHandler();
+    std::set_terminate(OnTerminate);
+    try {
+        return RunEmulator(argc, argv);
+    } catch (const std::exception& e) {
+        const std::string reason = std::string{"Excepción: "} + e.what();
+        LOG_CRITICAL(Frontend, "{}", reason);
+        Common::Log::Stop();
+        Ounce::Hos::WriteCrashNote(reason.c_str());
+        Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
+        return 1;
+    }
+}
+
+namespace {
+
+int RunEmulator(int argc, char** argv) {
     // Que el juego emulado no se pause si el usuario abre el menu HOME un instante.
     Ounce::Hos::SetNoSuspend();
 
@@ -171,6 +215,8 @@ int main(int argc, char** argv) {
     LOG_INFO(Frontend, "eden-ounce cerrado");
     return 0;
 }
+
+} // namespace
 
 #define VMA_IMPLEMENTATION
 #include "video_core/vulkan_common/vma.h"

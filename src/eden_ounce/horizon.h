@@ -31,6 +31,14 @@ bool InitNetwork();
 void ExitNetwork();
 std::uint64_t MonotonicNs();
 
+// ------------------------------------------------------------------ fallos
+/// Archivo donde se escriben los fallos (sdmc:/switch/eden/log/crash.txt).
+/// Un fallo de CPU (acceso inválido, instrucción ilegal...) se escribe solo, con
+/// PC/LR/FAR como desplazamiento dentro de eden.nro, para ubicarlo con addr2line.
+void InstallCrashHandler();
+/// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
+void WriteCrashNote(const char* text);
+
 // ------------------------------------------------------------------ vídeo
 void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).
 bool GetWindowSize(std::uint32_t& width, std::uint32_t& height);
