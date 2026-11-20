@@ -61,6 +61,16 @@ aarch64-none-elf-cmake -S . -B build-switch2 -G Ninja \
     ${EXTRA_CMAKE_ARGS:-}
 
 cmake --build build-switch2 --target eden-ounce ${BUILD_ARGS:-}
+# El .elf no basta: nx_create_nro crea su propio target (<target>_nro) que llama a elf2nro.
+cmake --build build-switch2 --target eden-ounce_nro || cmake --build build-switch2
+
+NRO=$(find build-switch2 -name '*.nro' -newer build-switch2/CMakeCache.txt | head -n 1)
+if [ -z "$NRO" ]; then
+    echo "!! No se generó ningún .nro" >&2
+    exit 1
+fi
+[ "$NRO" = "build-switch2/eden.nro" ] || cp "$NRO" build-switch2/eden.nro
+ls -la build-switch2/eden.nro
 
 echo
 echo ">> Listo: $EDEN_DIR/build-switch2/eden.nro"
