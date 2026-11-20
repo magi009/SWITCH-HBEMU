@@ -2559,6 +2559,41 @@ index 64d14ab..ba0dc23 100644
  target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
  
  add_dependencies(video_core host_shaders)
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index ab82c3f..1b50050 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -741,7 +741,8 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
+ }
+ 
+ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4>& swizzle,
+-                                 bool emulate_bgr565, bool emulate_a4b4g4r4) {
++                                 bool emulate_bgr565, bool emulate_a4b4g4r4,
++                                 bool emulate_r5g5b5a1) {
+     switch (format) {
+     case PixelFormat::A1B5G5R5_UNORM:
+         std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
+@@ -753,6 +754,10 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
+         break;
+     case PixelFormat::A5B5G5R1_UNORM:
+         std::ranges::transform(swizzle, swizzle.begin(), SwapSpecial);
++        if (emulate_r5g5b5a1) {
++            // La imagen real es B5G5R5A1: lo que R5G5B5A1 llamaba R ahora se lee como B.
++            std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
++        }
+         break;
+     case PixelFormat::G4R4_UNORM:
+         std::ranges::transform(swizzle, swizzle.begin(), SwapGreenRed);
+@@ -2587,7 +2592,8 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         swizzle = info.Swizzle();
+         TryTransformSwizzleIfNeeded(format, swizzle,
+                         device->MustEmulateBGR565(),
+-                        !device->IsExt4444FormatsSupported());
++                        !device->IsExt4444FormatsSupported(),
++                        device->MustEmulateR5G5B5A1());
+         if ((aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
+             std::ranges::transform(swizzle, swizzle.begin(), ConvertGreenRed);
+             SanitizeDepthStencilSwizzle(swizzle, device->SupportsDepthStencilSwizzleOne());
 diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
 index 2609e8d..feb5be6 100644
 --- a/src/video_core/vulkan_common/vulkan.h
@@ -2572,6 +2607,62 @@ index 2609e8d..feb5be6 100644
  #else
  #define VK_USE_PLATFORM_XLIB_KHR
  #define VK_USE_PLATFORM_WAYLAND_KHR
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 4897232..cdecd7f 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -65,6 +65,13 @@ constexpr std::array DEPTH16_UNORM_STENCIL8_UINT{
+     VK_FORMAT_UNDEFINED,
+ };
+ 
++// Mismo layout de bits que R5G5B5A1 con R y B intercambiados: la vista lo corrige con
++// el swizzle (ver MustEmulateR5G5B5A1). Hace falta, por ejemplo, en OunceVK (Switch 2).
++constexpr std::array R5G5B5A1_UNORM_PACK16{
++    VK_FORMAT_B5G5R5A1_UNORM_PACK16,
++    VK_FORMAT_UNDEFINED,
++};
++
+ constexpr std::array B5G6R5_UNORM_PACK16{
+     VK_FORMAT_R5G6B5_UNORM_PACK16,
+     VK_FORMAT_UNDEFINED,
+@@ -126,6 +133,8 @@ constexpr const VkFormat* GetFormatAlternatives(VkFormat format) {
+         return Alternatives::DEPTH16_UNORM_STENCIL8_UINT.data();
+     case VK_FORMAT_B5G6R5_UNORM_PACK16:
+         return Alternatives::B5G6R5_UNORM_PACK16.data();
++    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
++        return Alternatives::R5G5B5A1_UNORM_PACK16.data();
+     case VK_FORMAT_R4G4_UNORM_PACK8:
+         return Alternatives::R4G4_UNORM_PACK8.data();
+     case VK_FORMAT_R16G16B16_SFLOAT:
+@@ -996,6 +1005,14 @@ bool Device::MustEmulateBGR565() const {
+     return Settings::values.emulate_bgr565.GetValue();
+ }
+ 
++bool Device::MustEmulateR5G5B5A1() const {
++    constexpr VkFormatFeatureFlags usage = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++    return !IsFormatSupported(VK_FORMAT_R5G5B5A1_UNORM_PACK16, usage, FormatType::Optimal) &&
++           IsFormatSupported(VK_FORMAT_B5G5R5A1_UNORM_PACK16, usage, FormatType::Optimal);
++}
++
+ bool Device::GetSuitability(bool requires_swapchain) {
+     // Assume we will be suitable.
+     bool suitable = true;
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index c1f7c06..c5774ad 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -986,6 +986,9 @@ FN_MAX_LIMIT_LIST
+ 
+     bool MustEmulateBGR565() const;
+ 
++    /// true si el host no muestrea R5G5B5A1 y Eden lo sustituye por B5G5R5A1 (R<->B).
++    bool MustEmulateR5G5B5A1() const;
++
+     bool HasExactDepthBiasControl() const {
+         return features.depth_bias_control.depthBiasExact;
+     }
 diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
 index 7f3d8ed..626c85d 100644
 --- a/src/video_core/vulkan_common/vulkan_instance.cpp
