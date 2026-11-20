@@ -113,6 +113,9 @@ int RunEmulator(int argc, char** argv);
 } // namespace
 
 int main(int argc, char** argv) {
+    // Mientras depuramos en la consola: cada línea del log se escribe en la SD al instante,
+    // para que un cierre brusco no se lleve las últimas líneas.
+    Settings::values.log_flush_line.SetValue(true);
     Ounce::Hos::InstallCrashHandler();
     std::set_terminate(OnTerminate);
     try {

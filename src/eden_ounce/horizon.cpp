@@ -35,6 +35,29 @@ const char* DescribeException(u32 desc) {
     default: return "?";
     }
 }
+u64 NroOffset(u64 addr) {
+    const u64 base = reinterpret_cast<u64>(&__start__);
+    return addr >= base ? addr - base : 0;
+}
+
+// Pila de llamadas siguiendo los frame pointers (solo direcciones dentro de eden.nro).
+void DumpBacktrace(FILE* f, u64 fp) {
+    const u64 base = reinterpret_cast<u64>(&__start__);
+    std::fprintf(f, "Llamadas:\n");
+    for (int depth = 0; depth < 32 && fp != 0 && (fp & 0xF) == 0; ++depth) {
+        const u64* frame = reinterpret_cast<const u64*>(fp);
+        const u64 ret = frame[1];
+        if (ret < base) {
+            break;
+        }
+        std::fprintf(f, "  #%02d eden.nro+0x%lX\n", depth, ret - base);
+        if (frame[0] <= fp) {
+            break;
+        }
+        fp = frame[0];
+    }
+    std::fprintf(f, "\n");
+}
 } // namespace
 
 extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
@@ -55,24 +78,73 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
     for (int i = 0; i < 29; ++i) {
         std::fprintf(f, "X%-2d = 0x%016lX%s", i, ctx->cpu_gprs[i].x, (i % 2) ? "\n" : "   ");
     }
-    // Pila de llamadas siguiendo los frame pointers (solo dentro de eden.nro).
-    std::fprintf(f, "\nLlamadas:\n");
-    u64 fp = ctx->fp.x;
-    for (int depth = 0; depth < 32 && fp != 0 && (fp & 0xF) == 0; ++depth) {
-        const u64* frame = reinterpret_cast<const u64*>(fp);
-        const u64 ret = frame[1];
-        if (ret < base) {
-            break;
-        }
-        std::fprintf(f, "  #%02d eden.nro+0x%lX\n", depth, off(ret));
-        if (frame[0] <= fp) {
-            break;
-        }
-        fp = frame[0];
-    }
-    std::fprintf(f, "\n");
+    DumpBacktrace(f, ctx->fp.x);
     std::fclose(f);
 }
+
+// ---------------------------------------------------------------- salidas "silenciosas"
+// abort(), assert() de newlib, diagAbortWithResult, fatalThrow y svcBreak terminan el
+// proceso sin pasar por el handler de excepciones ni por std::terminate (por ejemplo,
+// un assert dentro del driver Vulkan o un fallo del JIT de kaiHEN). Con -Wl,--wrap
+// (ver CMakeLists.txt) pasan antes por aquí y dejan rastro en crash.txt.
+namespace {
+void NoteSilentExit(const char* what, const char* detail) {
+    FILE* f = std::fopen(kCrashPath, "a");
+    if (!f) {
+        return;
+    }
+    std::fprintf(f, "=== %s ===\n%s\n", what, detail ? detail : "");
+    std::fprintf(f, "llamado desde eden.nro+0x%lX\n",
+                 NroOffset(reinterpret_cast<u64>(__builtin_return_address(0))));
+    DumpBacktrace(f, reinterpret_cast<u64>(__builtin_frame_address(0)));
+    std::fclose(f);
+}
+} // namespace
+
+extern "C" {
+[[noreturn]] void __real_abort(void);
+void __real___assert_func(const char* file, int line, const char* func, const char* expr);
+[[noreturn]] void __real_diagAbortWithResult(Result res);
+[[noreturn]] void __real_fatalThrow(Result err);
+Result __real_svcBreak(u32 reason, uintptr_t address, uintptr_t size);
+
+[[noreturn]] void __wrap_abort(void) {
+    NoteSilentExit("abort()", nullptr);
+    __real_abort();
+}
+
+void __wrap___assert_func(const char* file, int line, const char* func, const char* expr) {
+    char detail[512];
+    std::snprintf(detail, sizeof(detail), "assert(%s) en %s:%d (%s)", expr ? expr : "?",
+                  file ? file : "?", line, func ? func : "?");
+    NoteSilentExit("assert fallido", detail);
+    __real___assert_func(file, line, func, expr);
+}
+
+[[noreturn]] void __wrap_diagAbortWithResult(Result res) {
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), "Result 0x%X (módulo %u, descripción %u)", res,
+                  R_MODULE(res), R_DESCRIPTION(res));
+    NoteSilentExit("diagAbortWithResult", detail);
+    __real_diagAbortWithResult(res);
+}
+
+[[noreturn]] void __wrap_fatalThrow(Result err) {
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), "Result 0x%X (módulo %u, descripción %u)", err,
+                  R_MODULE(err), R_DESCRIPTION(err));
+    NoteSilentExit("fatalThrow", detail);
+    __real_fatalThrow(err);
+}
+
+Result __wrap_svcBreak(u32 reason, uintptr_t address, uintptr_t size) {
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), "reason=0x%X address=0x%lX size=0x%lX", reason,
+                  static_cast<unsigned long>(address), static_cast<unsigned long>(size));
+    NoteSilentExit("svcBreak", detail);
+    return __real_svcBreak(reason, address, size);
+}
+} // extern "C"
 
 namespace Ounce::Hos {
 
