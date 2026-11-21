@@ -15,8 +15,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <exception>
 #include <cstdio>
 #include <filesystem>
+#include <format>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -27,6 +30,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
+#include "core/perf_stats.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -63,6 +67,9 @@ void ConfigureForSwitch2() {
     values.resolution_setup.SetValue(ResolutionSetup::Res1X);
     values.use_disk_shader_cache.SetValue(true);
     values.use_asynchronous_gpu_emulation.SetValue(true);
+    // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
+    // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
+    values.use_asynchronous_shaders.SetValue(true);
     // NVDEC por CPU necesita FFmpeg; desactivado hasta portarlo (los vídeos salen en negro).
     values.nvdec_emulation.SetValue(NvdecEmulation::Off);
     // Fase 1: sin backend de audio nativo todavía.
@@ -85,13 +92,64 @@ bool CheckKeys(std::string& error) {
 
 } // namespace
 
+extern "C" void eden_ounce_jit_stats(u64* count, u64* bytes, u64* ns) __attribute__((weak));
+
+namespace {
+
+/// Cualquier excepción de C++ sin atrapar (en cualquier hilo) termina aquí: dejar
+/// constancia en el log y en crash.txt antes de abortar, para no volver al hbmenu a ciegas.
+[[noreturn]] void OnTerminate() {
+    std::string reason = "std::terminate sin excepción activa";
+    if (const auto ex = std::current_exception()) {
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            reason = std::string{"Excepción sin atrapar: "} + e.what();
+        } catch (...) {
+            reason = "Excepción sin atrapar (tipo desconocido)";
+        }
+    }
+    // Primero crash.txt (escritura directa): vaciar el log puede bloquearse.
+    Ounce::Hos::WriteCrashNote(reason.c_str());
+    LOG_CRITICAL(Frontend, "{}", reason);
+    Common::Log::Stop(); // vacía el log a la SD
+    std::abort();
+}
+
+int RunEmulator(int argc, char** argv);
+
+} // namespace
+
 int main(int argc, char** argv) {
+    // El log ya no se escribe línea a línea (frenaba la emulación con escrituras a la SD);
+    // las migas de pan de crash.txt siguen siendo inmediatas.
+    Settings::values.log_flush_line.SetValue(false);
+    Ounce::Hos::InstallCrashHandler();
+    std::set_terminate(OnTerminate);
+    try {
+        return RunEmulator(argc, argv);
+    } catch (const std::exception& e) {
+        const std::string reason = std::string{"Excepción: "} + e.what();
+        Ounce::Hos::WriteCrashNote(reason.c_str());
+        LOG_CRITICAL(Frontend, "{}", reason);
+        Common::Log::Stop();
+        Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
+        return 1;
+    }
+}
+
+namespace {
+
+int RunEmulator(int argc, char** argv) {
     // Que el juego emulado no se pause si el usuario abre el menu HOME un instante.
     Ounce::Hos::SetNoSuspend();
 
     Common::Log::Initialize();
     Common::Log::Start();
     LOG_INFO(Frontend, "eden-ounce arrancando");
+    if (!Ounce::Hos::InitNetwork()) {
+        LOG_WARNING(Frontend, "Sin sockets: la red emulada no funcionara");
+    }
 
     std::string error;
     if (!CheckKeys(error)) {
@@ -107,6 +165,7 @@ int main(int argc, char** argv) {
         }
     }
     LOG_INFO(Frontend, "Juego: {}", filepath);
+    Ounce::Hos::Breadcrumb("juego elegido");
 
     ConfigureForSwitch2();
 
@@ -115,6 +174,7 @@ int main(int argc, char** argv) {
 
     system.Initialize();
     system.ApplySettings();
+    Ounce::Hos::Breadcrumb("Core::System inicializado");
 
     auto window = std::make_unique<EdenOunce::EmuWindowOunce>(input_subsystem, system);
 
@@ -126,7 +186,9 @@ int main(int argc, char** argv) {
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
     };
+    Ounce::Hos::Breadcrumb("cargando juego (incluye crear el renderer Vulkan)");
     const Core::SystemResultStatus load_result = system.Load(*window, filepath, load_parameters);
+    Ounce::Hos::Breadcrumb("system.Load terminado");
     if (load_result != Core::SystemResultStatus::Success) {
         const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
         std::string description = "Error de carga";
@@ -141,7 +203,9 @@ int main(int argc, char** argv) {
     }
 
     system.GPU().Start();
+    Ounce::Hos::Breadcrumb("GPU iniciada");
     system.GetCpuManager().OnGpuReady();
+    Ounce::Hos::Breadcrumb("CpuManager listo");
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         system.Renderer().ReadRasterizer()->LoadDiskResources(
@@ -149,24 +213,47 @@ int main(int argc, char** argv) {
             [](VideoCore::LoadCallbackStage, size_t, size_t) {});
     }
 
-    system.RegisterExitCallback([&window] { window->RequestClose(); });
+    Ounce::Hos::Breadcrumb("caché de shaders leída");
+    system.RegisterExitCallback([&window] {
+        Ounce::Hos::Breadcrumb("el juego pidió salir");
+        window->RequestClose();
+    });
 
     void(system.Run());
+    Ounce::Hos::Breadcrumb("emulación en marcha (system.Run)");
 
     // El emulador corre en sus propios hilos (núcleos de CPU, GPU, servicios);
     // este hilo solo bombea entrada y eventos del applet.
+    u64 loops = 0;
     while (window->PumpEvents()) {
         Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
+        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo + rendimiento
+            const auto perf = system.GetAndResetPerfStats();
+            u64 jit_count = 0, jit_bytes = 0, jit_ns = 0;
+            if (eden_ounce_jit_stats) {
+                eden_ounce_jit_stats(&jit_count, &jit_bytes, &jit_ns);
+            }
+            const std::string beat = std::format(
+                "latido {} s | velocidad {:.0f}% | juego {:.1f} FPS | JIT: {} publicaciones, "
+                "{} KiB, {:.1f} s en IPC",
+                loops / 250, perf.emulation_speed * 100.0, perf.average_game_fps, jit_count,
+                jit_bytes >> 10, static_cast<double>(jit_ns) / 1e9);
+            Ounce::Hos::Breadcrumb(beat.c_str());
+        }
     }
+    Ounce::Hos::Breadcrumb("saliendo del bucle principal");
 
     if (system.IsPoweredOn()) {
         system.Pause();
         system.ShutdownMainProcess();
     }
     window.reset();
+    Ounce::Hos::ExitNetwork();
     LOG_INFO(Frontend, "eden-ounce cerrado");
     return 0;
 }
+
+} // namespace
 
 #define VMA_IMPLEMENTATION
 #include "video_core/vulkan_common/vma.h"

@@ -30,6 +30,17 @@ target_link_libraries(eden-ounce PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 # kaihenJitPublishRanges; debe ir antes de libounce (-lnx) en la línea de enlace.
 target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
 
+# Diagnóstico: abort/assert/diagAbortWithResult/fatalThrow/svcBreak pasan por
+# horizon.cpp antes de cerrar el proceso, para que crash.txt diga por qué.
+# -fno-omit-frame-pointer en el frontend no basta para toda la pila, pero ayuda.
+target_link_options(eden-ounce PRIVATE
+    "LINKER:--wrap=abort,--wrap=__assert_func,--wrap=diagAbortWithResult,--wrap=fatalThrow,--wrap=svcBreak")
+# libounce no implementa pthread_detach: ver __wrap_pthread_detach en horizon.cpp.
+target_link_options(eden-ounce PRIVATE "LINKER:--wrap=pthread_detach")
+
+# Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
+target_link_libraries(eden-ounce PRIVATE -lz)
+
 nx_generate_nacp(eden-ounce.nacp
     NAME    "Eden"
     AUTHOR  "Eden Emulator Project (port Ounce)"

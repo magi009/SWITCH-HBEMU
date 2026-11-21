@@ -1,0 +1,136 @@
+# Compila eden.nro con el toolchain real (devkitA64 + ounce-devkit) en GitHub Actions.
+# Cada ejecución sube eden.nro (si enlaza) y los logs, para ir arreglando errores.
+name: build-switch2
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-switch2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # La misma base que el Dockerfile de ounce-devkit.
+    container: docker.io/devkitpro/devkita64:20260219
+    defaults:
+      run:
+        # bash con -eo pipefail: un fallo dentro de "| tee" también hace fallar el paso.
+        shell: bash
+    env:
+      DEVKITPRO: /opt/devkitpro
+      CCACHE_MAXSIZE: 4G
+    steps:
+      - name: Herramientas del host
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates ninja-build python3 python3-pip \
+            glslang-tools ccache perl make zstd xz-utils
+          # Eden necesita CMake >= 3.31; Debian trae uno más viejo.
+          pip3 install --break-system-packages "cmake>=3.31,<4.1"
+          cmake --version
+
+      - uses: actions/checkout@v4
+
+      - name: ounce-devkit (libounce, OunceVK, libkaihen)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEVKIT_VERSION: "20261117"
+          DEVKIT_SHA256: 33cc5478324f8243dc801c3d4b8fe781885a306975f63937bd246ffdfd73cf79
+        run: |
+          # pkg.devkitpro.org bloquea a los runners de GitHub (403), así que no usamos
+          # dkp-pacman: instalamos el archivo publicado en las releases de ounce-devkit.
+          name="ounce-devkit-$DEVKIT_VERSION.tar.xz"
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  "https://api.github.com/repos/ouncebrew/ounce-devkit/releases?per_page=100" |
+                python3 -c "import json,sys; n=sys.argv[1]; print(next(a['browser_download_url'] for r in json.load(sys.stdin) for a in r['assets'] if a['name']==n))" "$name")
+          echo "Descargando $url"
+          curl -fsSL -o "/tmp/$name" "$url"
+          echo "$DEVKIT_SHA256  /tmp/$name" | sha256sum -c -
+          tar -xJf "/tmp/$name" -C "$DEVKITPRO"
+          cat "$DEVKITPRO/ounce-devkit-version.txt"
+          ls "$DEVKITPRO/portlibs/switch2/lib"
+          # ¿Qué portlibs de Switch 1 trae ya la imagen?
+          ls "$DEVKITPRO/portlibs/switch/lib" | tr "\n" " " || true
+
+      - name: Caché de OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: openssl-prefix
+          key: openssl-3.6.2-switch2-${{ hashFiles('ci/build-openssl.sh') }}
+
+      - name: OpenSSL para Switch 2
+        run: |
+          if [ -d openssl-prefix/lib ]; then
+            cp -a openssl-prefix/. $DEVKITPRO/portlibs/switch2/
+          else
+            sh ci/build-openssl.sh 2>&1 | tee openssl.log
+            mkdir -p openssl-prefix/lib openssl-prefix/include
+            cp -a $DEVKITPRO/portlibs/switch2/lib/libssl.a $DEVKITPRO/portlibs/switch2/lib/libcrypto.a \
+                  $DEVKITPRO/portlibs/switch2/lib/libdl.a openssl-prefix/lib/
+            cp -a $DEVKITPRO/portlibs/switch2/lib/pkgconfig openssl-prefix/lib/ || true
+            cp -a $DEVKITPRO/portlibs/switch2/lib/cmake openssl-prefix/lib/ || true
+            cp -a $DEVKITPRO/portlibs/switch2/include/openssl openssl-prefix/include/
+          fi
+
+      - name: Eden en BASE_COMMIT
+        run: |
+          git init -q eden
+          git -C eden remote add origin https://github.com/eden-emulator/mirror
+          git -C eden fetch -q --depth 1 origin "$(cat patches/BASE_COMMIT)"
+          git -C eden checkout -q FETCH_HEAD
+
+      - name: Restaurar ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.sha }}-${{ github.run_attempt }}
+          restore-keys: ccache-
+
+      - name: Compilar eden.nro
+        run: |
+          # Dentro del contenedor el workspace es /__w/..., no ${{ github.workspace }}:
+          # ccache tiene que escribir en la carpeta que guardan los pasos de caché.
+          export CCACHE_DIR="$PWD/.ccache"
+          ccache -z || true
+          # -k 0: seguir compilando tras un error para ver TODOS los fallos de una vez.
+          BUILD_ARGS="-- -k 0" ./build.sh "$PWD/eden" 2>&1 | tee build.log
+          ccache -s || true
+
+      # Guardar ccache aunque la compilación falle: así el siguiente intento
+      # solo recompila lo que cambió (en vez de ~1,5 h desde cero).
+      - name: Guardar ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.sha }}-${{ github.run_attempt }}
+
+      - name: Resumen de errores
+        if: always()
+        run: |
+          [ -f build.log ] || exit 0
+          grep -nE "error:|Error [0-9]|undefined reference|CMake Error" build.log | head -300 > errors.txt || true
+          echo "Errores: $(wc -l < errors.txt)"
+          head -80 errors.txt
+
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-switch2-${{ github.run_number }}
+          path: |
+            eden/build-switch2/eden.nro
+            eden/build-switch2/bin/eden-ounce.elf
+            build.log
+            errors.txt
+            openssl.log
+            eden/build-switch2/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore

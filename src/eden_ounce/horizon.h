@@ -25,7 +25,22 @@ bool MainLoop();         ///< appletMainLoop(): false si el sistema pide cerrar.
 bool IsDocked();         ///< true en modo TV/dock.
 bool IsInFocus();
 void SleepNs(std::int64_t ns);
+/// Inicializa los sockets BSD de libounce (los usa la red emulada y su socket de
+/// interrupción). Devuelve false si no hay servicio de red; el emulador sigue igual.
+bool InitNetwork();
+void ExitNetwork();
 std::uint64_t MonotonicNs();
+
+// ------------------------------------------------------------------ fallos
+/// Archivo donde se escriben los fallos (sdmc:/switch/eden/log/crash.txt).
+/// Un fallo de CPU (acceso inválido, instrucción ilegal...) se escribe solo, con
+/// PC/LR/FAR como desplazamiento dentro de eden.nro, para ubicarlo con addr2line.
+void InstallCrashHandler();
+/// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
+void WriteCrashNote(const char* text);
+/// Migas de pan: una línea con marca de tiempo en crash.txt, escrita al instante (sin el
+/// hilo del log de Eden), para saber hasta dónde llegó el arranque si el proceso muere.
+void Breadcrumb(const char* text);
 
 // ------------------------------------------------------------------ vídeo
 void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).

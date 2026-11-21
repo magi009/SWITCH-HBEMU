@@ -101,18 +101,16 @@ export DEVKITPRO=/opt/devkitpro
 
 ## Lo que falta, por orden
 
-**Fase 0: que enlace (lo siguiente).** Eden depende de bibliotecas que no están en los
-portlibs de Switch 2. Hay que compilarlas con `switch2vars.sh` o hacerles un parche:
+**Fase 0: compilar y enlazar (hecha).** El CI (`.github/workflows/build-switch2.yml`)
+genera `eden.nro` (~40 MB) con devkitA64 GCC 15.2 + ounce-devkit 20261117. Puedes
+descargarlo desde los artefactos de cada ejecución en la pestaña **Actions**.
 
-- **Boost:** context (las fibras usan `fcontext` aarch64/ELF, que debería funcionar),
-  asio y el resto.
-- **OpenSSL o mbedTLS, Opus, zstd, lz4, fmt, nlohmann_json, simpleini y frozen.**
-- **sirit, SPIRV-Headers y SPIRV-Tools:** los shaders de Maxwell se traducen a SPIR-V.
-- **FFmpeg:** solo si quieres vídeos. Por ahora NVDEC está apagado.
-- **`src/network`:** usa sockets BSD, y libnx los tiene (`socketInitialize`).
-
-Puede que aparezcan más rutas POSIX que la revisión con headers de host no detectó:
-nombres de hilos, prioridades, `std::filesystem` en devkitA64, `sysconf`, etc.
+- OpenSSL 3.6.2 se compila para Switch 2 (`ci/build-openssl.sh`). FFmpeg, dav1d, zlib
+  y zstd salen de los portlibs de la imagen de devkitPro, y el resto de las
+  dependencias, de CPM.
+- En Switch 2 se quitaron o quedaron vacíos el depurador GDB, HTTP (hydrocarbon), el
+  cliente UDP de mandos, renderdoc y `signal_chain`.
+- Nada de esto se ha probado todavía en la consola.
 
 **Fase 1: arrancar homebrew.** Probar primero con `.nro` caseros (más fácil de depurar
 que un juego comercial). Medir el coste por IPC de `kaihenJitPublishRanges`. Si es alto,
