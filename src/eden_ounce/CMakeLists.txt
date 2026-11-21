@@ -35,6 +35,8 @@ target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
 # -fno-omit-frame-pointer en el frontend no basta para toda la pila, pero ayuda.
 target_link_options(eden-ounce PRIVATE
     "LINKER:--wrap=abort,--wrap=__assert_func,--wrap=diagAbortWithResult,--wrap=fatalThrow,--wrap=svcBreak")
+# libounce no implementa pthread_detach: ver __wrap_pthread_detach en horizon.cpp.
+target_link_options(eden-ounce PRIVATE "LINKER:--wrap=pthread_detach")
 
 # Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
 target_link_libraries(eden-ounce PRIVATE -lz)

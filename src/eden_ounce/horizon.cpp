@@ -7,6 +7,7 @@
 #include <ctime>
 
 #include <malloc.h>
+#include <pthread.h>
 
 #include <switch.h>
 
@@ -109,6 +110,16 @@ extern "C" {
 // Para código fuera del frontend (Dynarmic): mismas migas de pan, sin headers de libnx.
 void eden_ounce_breadcrumb(const char* text) {
     Ounce::Hos::Breadcrumb(text);
+}
+
+// libounce no implementa pthread_detach (en newlib.c está comentado como "Unsupported"),
+// así que std::thread::detach() fallaba y lanzaba std::system_error. Eden separa así
+// los hilos de los servicios HLE, que viven hasta que se cierra el emulador.
+// Un hilo separado no se une nunca: basta con no tocarlo (su estructura queda reservada,
+// unos pocos bytes por servicio).
+int __wrap_pthread_detach(pthread_t thread) {
+    (void)thread;
+    return 0;
 }
 
 [[noreturn]] void __real_abort(void);

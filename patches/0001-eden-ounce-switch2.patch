@@ -1767,10 +1767,10 @@ index 7833b65..d63cf87 100644
  }  // namespace Dynarmic
 diff --git a/src/eden_ounce/CMakeLists.txt b/src/eden_ounce/CMakeLists.txt
 new file mode 100644
-index 0000000..1867a15
+index 0000000..63c8672
 --- /dev/null
 +++ b/src/eden_ounce/CMakeLists.txt
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,53 @@
 +# SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1808,6 +1808,8 @@ index 0000000..1867a15
 +# -fno-omit-frame-pointer en el frontend no basta para toda la pila, pero ayuda.
 +target_link_options(eden-ounce PRIVATE
 +    "LINKER:--wrap=abort,--wrap=__assert_func,--wrap=diagAbortWithResult,--wrap=fatalThrow,--wrap=svcBreak")
++# libounce no implementa pthread_detach: ver __wrap_pthread_detach en horizon.cpp.
++target_link_options(eden-ounce PRIVATE "LINKER:--wrap=pthread_detach")
 +
 +# Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
 +target_link_libraries(eden-ounce PRIVATE -lz)
@@ -2018,10 +2020,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..e479bb2
+index 0000000..c9e6a75
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,304 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2031,6 +2033,7 @@ index 0000000..e479bb2
 +#include <ctime>
 +
 +#include <malloc.h>
++#include <pthread.h>
 +
 +#include <switch.h>
 +
@@ -2133,6 +2136,16 @@ index 0000000..e479bb2
 +// Para código fuera del frontend (Dynarmic): mismas migas de pan, sin headers de libnx.
 +void eden_ounce_breadcrumb(const char* text) {
 +    Ounce::Hos::Breadcrumb(text);
++}
++
++// libounce no implementa pthread_detach (en newlib.c está comentado como "Unsupported"),
++// así que std::thread::detach() fallaba y lanzaba std::system_error. Eden separa así
++// los hilos de los servicios HLE, que viven hasta que se cierra el emulador.
++// Un hilo separado no se une nunca: basta con no tocarlo (su estructura queda reservada,
++// unos pocos bytes por servicio).
++int __wrap_pthread_detach(pthread_t thread) {
++    (void)thread;
++    return 0;
 +}
 +
 +[[noreturn]] void __real_abort(void);
@@ -2524,10 +2537,10 @@ index 0000000..f883d4e
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..5bd5c52
+index 0000000..977ccb9
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,244 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2633,9 +2646,10 @@ index 0000000..5bd5c52
 +            reason = "Excepción sin atrapar (tipo desconocido)";
 +        }
 +    }
++    // Primero crash.txt (escritura directa): vaciar el log puede bloquearse.
++    Ounce::Hos::WriteCrashNote(reason.c_str());
 +    LOG_CRITICAL(Frontend, "{}", reason);
 +    Common::Log::Stop(); // vacía el log a la SD
-+    Ounce::Hos::WriteCrashNote(reason.c_str());
 +    std::abort();
 +}
 +
@@ -2653,9 +2667,9 @@ index 0000000..5bd5c52
 +        return RunEmulator(argc, argv);
 +    } catch (const std::exception& e) {
 +        const std::string reason = std::string{"Excepción: "} + e.what();
++        Ounce::Hos::WriteCrashNote(reason.c_str());
 +        LOG_CRITICAL(Frontend, "{}", reason);
 +        Common::Log::Stop();
-+        Ounce::Hos::WriteCrashNote(reason.c_str());
 +        Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
 +        return 1;
 +    }

@@ -103,9 +103,10 @@ namespace {
             reason = "Excepción sin atrapar (tipo desconocido)";
         }
     }
+    // Primero crash.txt (escritura directa): vaciar el log puede bloquearse.
+    Ounce::Hos::WriteCrashNote(reason.c_str());
     LOG_CRITICAL(Frontend, "{}", reason);
     Common::Log::Stop(); // vacía el log a la SD
-    Ounce::Hos::WriteCrashNote(reason.c_str());
     std::abort();
 }
 
@@ -123,9 +124,9 @@ int main(int argc, char** argv) {
         return RunEmulator(argc, argv);
     } catch (const std::exception& e) {
         const std::string reason = std::string{"Excepción: "} + e.what();
+        Ounce::Hos::WriteCrashNote(reason.c_str());
         LOG_CRITICAL(Frontend, "{}", reason);
         Common::Log::Stop();
-        Ounce::Hos::WriteCrashNote(reason.c_str());
         Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
         return 1;
     }
