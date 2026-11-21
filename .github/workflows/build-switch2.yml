@@ -128,6 +128,7 @@ jobs:
           name: eden-switch2-${{ github.run_number }}
           path: |
             eden/build-switch2/eden.nro
+            eden/build-switch2/bin/eden-ounce.elf
             build.log
             errors.txt
             openssl.log

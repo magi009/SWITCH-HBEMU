@@ -2070,10 +2070,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..c9e6a75
+index 0000000..a44177f
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,309 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2083,6 +2083,7 @@ index 0000000..c9e6a75
 +#include <ctime>
 +
 +#include <malloc.h>
++#include <unistd.h>
 +#include <pthread.h>
 +
 +#include <switch.h>
@@ -2273,15 +2274,19 @@ index 0000000..c9e6a75
 +}
 +
 +void Breadcrumb(const char* text) {
-+    // libnx reserva casi toda la memoria como heap al arrancar, así que svcGetInfo siempre dice
-+    // "lleno". Lo útil es cuánto del heap está ocupado (malloc) y cuánto queda.
-+    const struct mallinfo mi = mallinfo();
-+    const u64 heap_size = static_cast<u64>(fake_heap_end - fake_heap_start);
-+    const u64 in_use = static_cast<u64>(mi.uordblks);
++    // libnx reserva casi toda la memoria como heap al arrancar (svcGetInfo siempre dice "lleno")
++    // y mallinfo de newlib no lo ve. Lo útil es hasta dónde llegó malloc dentro del heap:
++    // el "break" (sbrk(0)) menos el inicio de la región de heap. Nunca baja: es el máximo.
++    u64 heap_base = 0;
++    u64 total = 0;
++    svcGetInfo(&heap_base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
++    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    const u64 brk = reinterpret_cast<u64>(sbrk(0));
++    const u64 used = brk > heap_base ? brk - heap_base : 0;
 +    FILE* f = std::fopen(kCrashPath, "a");
 +    if (f) {
-+        std::fprintf(f, "[%10.3f] (heap %lu/%lu MiB) %s\n",
-+                     static_cast<double>(MonotonicNs()) / 1e9, in_use >> 20, heap_size >> 20, text);
++        std::fprintf(f, "[%10.3f] (heap máx %lu/%lu MiB) %s\n",
++                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
 +        std::fclose(f);
 +    }
 +}
@@ -3217,7 +3222,7 @@ index 2609e8d..feb5be6 100644
  #define VK_USE_PLATFORM_XLIB_KHR
  #define VK_USE_PLATFORM_WAYLAND_KHR
 diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
-index 4897232..0c4dff0 100644
+index 4897232..552adfa 100644
 --- a/src/video_core/vulkan_common/vulkan_device.cpp
 +++ b/src/video_core/vulkan_common/vulkan_device.cpp
 @@ -65,6 +65,13 @@ constexpr std::array DEPTH16_UNORM_STENCIL8_UINT{
@@ -3266,6 +3271,22 @@ index 4897232..0c4dff0 100644
  bool Device::GetSuitability(bool requires_swapchain) {
      // Assume we will be suitable.
      bool suitable = true;
+@@ -1658,6 +1683,15 @@ void Device::CollectPhysicalMemoryInfo() {
+             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
+         }
+     }
++#ifdef __SWITCH2__
++    // En Switch 2 la "VRAM" sale del mismo heap que la RAM emulada (4 GiB), la tabla de
++    // páginas (1 GiB) y el JIT: con el presupuesto de 4 GiB por defecto el proceso se quedaba
++    // sin memoria (std::bad_alloc) a los ~20 min. Con 2 GiB la caché de texturas empieza a
++    // liberar mucho antes.
++    device_access_memory = std::min<u64>(device_access_memory, 2_GiB);
++    LOG_INFO(Render_Vulkan, "Switch 2: presupuesto de VRAM limitado a {} MiB",
++             device_access_memory >> 20);
++#endif
+ }
+ 
+ void Device::CollectToolingInfo() {
 diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
 index c1f7c06..547c01d 100644
 --- a/src/video_core/vulkan_common/vulkan_device.h

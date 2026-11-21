@@ -7,6 +7,7 @@
 #include <ctime>
 
 #include <malloc.h>
+#include <unistd.h>
 #include <pthread.h>
 
 #include <switch.h>
@@ -197,15 +198,19 @@ void InstallCrashHandler() {
 }
 
 void Breadcrumb(const char* text) {
-    // libnx reserva casi toda la memoria como heap al arrancar, así que svcGetInfo siempre dice
-    // "lleno". Lo útil es cuánto del heap está ocupado (malloc) y cuánto queda.
-    const struct mallinfo mi = mallinfo();
-    const u64 heap_size = static_cast<u64>(fake_heap_end - fake_heap_start);
-    const u64 in_use = static_cast<u64>(mi.uordblks);
+    // libnx reserva casi toda la memoria como heap al arrancar (svcGetInfo siempre dice "lleno")
+    // y mallinfo de newlib no lo ve. Lo útil es hasta dónde llegó malloc dentro del heap:
+    // el "break" (sbrk(0)) menos el inicio de la región de heap. Nunca baja: es el máximo.
+    u64 heap_base = 0;
+    u64 total = 0;
+    svcGetInfo(&heap_base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    const u64 brk = reinterpret_cast<u64>(sbrk(0));
+    const u64 used = brk > heap_base ? brk - heap_base : 0;
     FILE* f = std::fopen(kCrashPath, "a");
     if (f) {
-        std::fprintf(f, "[%10.3f] (heap %lu/%lu MiB) %s\n",
-                     static_cast<double>(MonotonicNs()) / 1e9, in_use >> 20, heap_size >> 20, text);
+        std::fprintf(f, "[%10.3f] (heap máx %lu/%lu MiB) %s\n",
+                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
         std::fclose(f);
     }
 }
