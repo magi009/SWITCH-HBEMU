@@ -1,8 +1,56 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b3a875a..a5e956a 100644
+index b3a875a..bbfa59e 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -563,7 +563,7 @@ if (NOT YUZU_STATIC_ROOM)
+@@ -23,6 +23,11 @@ if (CMAKE_GENERATOR MATCHES "Ninja" AND WIN32)
+ endif()
+ 
+ include(DetectPlatform)
++
++if (NINTENDO_SWITCH2)
++    # Horizon no tiene libdl (ni carga dinámica); FindOpenSSL lo añadiría como -ldl.
++    set(CMAKE_DL_LIBS "")
++endif()
+ include(DetectArchitecture)
+ include(DefaultConfig)
+ include(UseLTO)
+@@ -414,11 +419,33 @@ set(BUILD_TESTING OFF)
+ set(ENABLE_TESTING OFF)
+ 
+ # boost
+-set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
+-    process filesystem crc variant pfr)
++if (NINTENDO_SWITCH2)
++    # newlib no anuncia _POSIX_THREADS, pero libounce implementa pthreads: sin esto
++    # Boost.Config cae en la rama de Win32 (InitializeCriticalSection...).
++    add_compile_definitions(BOOST_HAS_PTHREADS)
++    # Sin process ni filesystem (fork/exec y una biblioteca compilada que Horizon no necesita).
++    # context sí: las fibras del núcleo usan su fcontext en ensamblador (aarch64/aapcs/elf).
++    set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
++        context crc variant pfr)
++else()
++    set(BOOST_INCLUDE_LIBRARIES algorithm icl pool container heap asio headers
++        process filesystem crc variant pfr)
++endif()
+ 
+ AddJsonPackage(boost)
+ 
++if (NINTENDO_SWITCH2)
++    # dlmalloc de Boost.Container: sin mmap en Horizon (usa sbrk de newlib).
++    if (TARGET boost_container)
++        target_compile_definitions(boost_container PRIVATE LACKS_SYS_MMAN_H=1 HAVE_MMAP=0)
++    endif()
++    # Boost.Context pregunta getrlimit(RLIMIT_STACK); shim en src/eden_ounce/compat.
++    if (TARGET boost_context)
++        target_include_directories(boost_context BEFORE PRIVATE
++            ${PROJECT_SOURCE_DIR}/src/eden_ounce/compat)
++    endif()
++endif()
++
+ # really annoying thing where boost::headers doesn't work with cpm
+ # TODO(crueter) investigate
+ set(BOOST_NO_HEADERS ${Boost_ADDED})
+@@ -563,7 +590,7 @@ if (NOT YUZU_STATIC_ROOM)
          find_package(oaknut)
      endif()
  
@@ -32,11 +80,95 @@ index 194d315..6b80d98 100644
  
  # SPIRV Headers
  AddJsonPackage(spirv-headers)
+diff --git a/externals/cmake-modules/CompilerChecks.cmake b/externals/cmake-modules/CompilerChecks.cmake
+index a1ceb37..3fa43d9 100644
+--- a/externals/cmake-modules/CompilerChecks.cmake
++++ b/externals/cmake-modules/CompilerChecks.cmake
+@@ -21,7 +21,10 @@ if (id MATCHES "AppleClang")
+ endif()
+ 
+ # GCC must be 16+
+-if (id MATCHES "GNU" AND ver VERSION_LESS 16)
++# Switch 2: devkitA64 trae GCC 15; se permite (con aviso) mientras no haya uno más nuevo.
++if (id MATCHES "GNU" AND ver VERSION_LESS 16 AND NINTENDO_SWITCH2 AND NOT ver VERSION_LESS 15)
++    message(WARNING "GCC ${ver} (devkitA64): Eden pide 16+; los módulos C++20 pueden fallar.")
++elseif (id MATCHES "GNU" AND ver VERSION_LESS 16)
+     message(FATAL_ERROR "Unsupported GCC version ${ver}. Only 16 and up "
+         "are supported.")
+ endif()
+diff --git a/externals/ffmpeg/CMakeLists.txt b/externals/ffmpeg/CMakeLists.txt
+index f1bf099..5db35c5 100644
+--- a/externals/ffmpeg/CMakeLists.txt
++++ b/externals/ffmpeg/CMakeLists.txt
+@@ -35,7 +35,8 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
+     elseif (NOT (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES CMAKE_SYSTEM_PROCESSOR
+     AND CMAKE_HOST_SYSTEM_NAME MATCHES CMAKE_SYSTEM_NAME))
+         string(TOLOWER "${CMAKE_SYSTEM_NAME}" FFmpeg_SYSTEM_NAME)
+-        if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm")
++        if (FFmpeg_SYSTEM_NAME STREQUAL "openorbis" OR FFmpeg_SYSTEM_NAME STREQUAL "managarm"
++            OR FFmpeg_SYSTEM_NAME STREQUAL "nintendoswitch")
+             set(FFmpeg_SYSTEM_NAME "none")
+         endif()
+         # TODO: Can we really do better? Auto-detection? Something clever?
+@@ -54,7 +55,7 @@ if (NOT YUZU_USE_BUNDLED_FFMPEG)
+     endif()
+ endif()
+ 
+-if (OPENORBIS OR MANAGARM)
++if (OPENORBIS OR MANAGARM OR NINTENDO_SWITCH2)
+     # Doesn't support VA-API, don't go thru the embarrassment of trying to enable it
+     list(APPEND FFmpeg_HWACCEL_FLAGS --disable-vaapi)
+ elseif (ANDROID)
+@@ -178,6 +179,19 @@ elseif (MANAGARM)
+     )
+ endif()
+ 
++if (NINTENDO_SWITCH2)
++    # Switch 2 (libounce): las mismas opciones que switch2vars.sh, y libnx para que
++    # los programas de prueba del configure de FFmpeg enlacen.
++    list(APPEND FFmpeg_CROSS_COMPILE_FLAGS
++        "--extra-cflags=$ENV{CFLAGS} $ENV{CPPFLAGS}"
++        "--extra-cxxflags=$ENV{CXXFLAGS} $ENV{CPPFLAGS}"
++        "--extra-ldflags=-specs=${NX_ROOT}/switch.specs $ENV{LDFLAGS}"
++        "--extra-libs=-lnx"
++        --disable-network
++        --disable-asm
++    )
++endif()
++
+ if (YUZU_USE_BUNDLED_FFMPEG)
+     AddJsonPackage(ffmpeg-ci)
+ 
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 305c744..7f10195 100644
+index 305c744..c79636f 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -321,6 +321,10 @@ add_subdirectory(video_core)
+@@ -262,8 +262,11 @@ endif()
+ # Jacinth (json)
+ AddJsonPackage(jacinth)
+ 
+-# Hydrocarbon (http)
+-AddJsonPackage(hydrocarbon)
++# Hydrocarbon (http). En Switch 2 no: su capa de sockets no conoce Horizon y el
++# emulador no necesita HTTP (sin buscador de actualizaciones ni servicios web).
++if (NOT NINTENDO_SWITCH2)
++    AddJsonPackage(hydrocarbon)
++endif()
+ 
+ # Disable rtti, enable fwrapv, link POSIX threads
+ macro(fix_modules target type)
+@@ -293,7 +296,9 @@ else()
+ endif()
+ 
+ # ditto, hydrocarbon
+-if (hydrocarbon_ADDED)
++if (NINTENDO_SWITCH2)
++    # sin hydrocarbon
++elseif (hydrocarbon_ADDED)
+     fix_modules(hydrocarbon PRIVATE)
+ else()
+     fix_modules(hydro::carbon INTERFACE)
+@@ -321,6 +326,10 @@ add_subdirectory(video_core)
  add_subdirectory(hid_core)
  add_subdirectory(input_common)
  add_subdirectory(frontend_common)
@@ -70,6 +202,46 @@ index b244d65..a50d2cb 100644
 +endif()
  
  create_target_directory_groups(audio_core)
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 0be3249..25f8085 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -159,10 +159,15 @@ if(WIN32)
+     target_link_libraries(common PRIVATE ntdll)
+ endif()
+ 
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT NINTENDO_SWITCH2)
+     target_sources(common PRIVATE signal_chain.cpp signal_chain.h)
+ endif()
+ 
++if(NINTENDO_SWITCH2)
++    # Único punto de common/ que habla con libounce (ver horizon/horizon_os.h).
++    target_sources(common PRIVATE horizon/horizon_os.cpp horizon/horizon_os.h)
++endif()
++
+ if(ANDROID)
+     target_sources(
+         common
+@@ -238,8 +243,16 @@ if (BOOST_NO_HEADERS)
+ else()
+     target_link_libraries(common PUBLIC Boost::headers)
+ endif()
+-target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
+-target_link_libraries(common PUBLIC Boost::filesystem Boost::context)
++if (NINTENDO_SWITCH2)
++    target_link_libraries(common PRIVATE OpenSSL::SSL jacinth::jacinth)
++else()
++    target_link_libraries(common PRIVATE OpenSSL::SSL hydro::carbon jacinth::jacinth)
++endif()
++if (NINTENDO_SWITCH2)
++    target_link_libraries(common PUBLIC Boost::context)
++else()
++    target_link_libraries(common PUBLIC Boost::filesystem Boost::context)
++endif()
+ 
+ if (lz4_ADDED)
+     target_include_directories(common PRIVATE ${lz4_SOURCE_DIR}/lib)
 diff --git a/src/common/dynamic_library.cpp b/src/common/dynamic_library.cpp
 index 9bf2c94..f5052ad 100644
 --- a/src/common/dynamic_library.cpp
@@ -214,6 +386,154 @@ index f040e84..daf5e7a 100644
  }
  
  fs::path GetDataDirectory(const std::string& env_name) {
+diff --git a/src/common/fs/symlink.cpp b/src/common/fs/symlink.cpp
+index e8a27a1..1d2e790 100644
+--- a/src/common/fs/symlink.cpp
++++ b/src/common/fs/symlink.cpp
+@@ -8,7 +8,9 @@
+ #include <windows.h>
+ #endif
+ 
++#ifndef __SWITCH2__
+ #include <boost/filesystem.hpp>
++#endif
+ 
+ namespace fs = std::filesystem;
+ 
+@@ -50,7 +52,13 @@ bool CreateSymlink(fs::path from, fs::path to)
+ 
+ bool IsSymlink(const fs::path &path)
+ {
++#ifdef __SWITCH2__
++    // Boost.Filesystem es una biblioteca compilada; en la SD no hay enlaces simbólicos.
++    std::error_code ec;
++    return fs::is_symlink(path, ec);
++#else
+     return boost::filesystem::is_symlink(boost::filesystem::path{path});
++#endif
+ }
+ 
+ } // namespace Common::FS
+diff --git a/src/common/horizon/breadcrumb.h b/src/common/horizon/breadcrumb.h
+new file mode 100644
+index 0000000..c0134e7
+--- /dev/null
++++ b/src/common/horizon/breadcrumb.h
+@@ -0,0 +1,32 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Migas de pan para depurar el arranque en Switch 2 (ver eden_ounce/horizon.cpp).
++// En Horizon/KaiHEN los fallos de CPU no llegan al proceso, así que la única forma de
++// saber dónde muere es dejar una línea escrita al instante antes de cada paso.
++// Fuera de Switch 2 no hace nada.
++
++#pragma once
++
++#ifdef __SWITCH2__
++extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
++#define EDEN_CRUMB(text)                                                                           \
++    do {                                                                                           \
++        if (eden_ounce_breadcrumb) {                                                               \
++            eden_ounce_breadcrumb(text);                                                           \
++        }                                                                                          \
++    } while (0)
++#include <string>
++#include <string_view>
++/// Igual que EDEN_CRUMB, con un nombre al final (p. ej. el del servicio).
++#define EDEN_CRUMB_NAMED(prefix, name)                                                             \
++    do {                                                                                           \
++        if (eden_ounce_breadcrumb) {                                                               \
++            const std::string eden_crumb_text = std::string{prefix} + std::string{name};           \
++            eden_ounce_breadcrumb(eden_crumb_text.c_str());                                        \
++        }                                                                                          \
++    } while (0)
++#else
++#define EDEN_CRUMB(text) ((void)0)
++#define EDEN_CRUMB_NAMED(prefix, name) ((void)0)
++#endif
+diff --git a/src/common/horizon/horizon_os.cpp b/src/common/horizon/horizon_os.cpp
+new file mode 100644
+index 0000000..c6f3073
+--- /dev/null
++++ b/src/common/horizon/horizon_os.cpp
+@@ -0,0 +1,38 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Único archivo de common/ que incluye <switch.h>. No incluir headers de Eden aquí.
++
++#include <bit>
++
++#include <switch.h>
++
++#include "common/horizon/horizon_os.h"
++
++namespace Common::Horizon {
++
++std::uint64_t TotalMemorySize() {
++    u64 value = 0;
++    svcGetInfo(&value, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    return value;
++}
++
++std::uint64_t UsedMemorySize() {
++    u64 value = 0;
++    svcGetInfo(&value, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++    return value;
++}
++
++void SetCurrentThreadPriority(int horizon_priority) {
++    svcSetThreadPriority(threadGetCurHandle(), static_cast<u32>(horizon_priority));
++}
++
++int CoreCount() {
++    u64 mask = 0;
++    if (R_FAILED(svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) || mask == 0) {
++        return 3; // lo mínimo que un juego tiene garantizado
++    }
++    return std::popcount(mask);
++}
++
++} // namespace Common::Horizon
+diff --git a/src/common/horizon/horizon_os.h b/src/common/horizon/horizon_os.h
+new file mode 100644
+index 0000000..d318b82
+--- /dev/null
++++ b/src/common/horizon/horizon_os.h
+@@ -0,0 +1,32 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Puente mínimo hacia Horizon (libounce) para el código común de Eden.
++//
++// libnx y Eden no pueden compartir una unidad de compilación (libnx define
++// `struct Service`, `u128` y macros como BIT()). Este header solo usa tipos
++// estándar; la implementación (horizon_os.cpp) es la única que incluye <switch.h>.
++
++#pragma once
++
++#ifdef __SWITCH2__
++
++#include <cstdint>
++
++namespace Common::Horizon {
++
++/// Memoria total concedida al proceso (svcGetInfo TotalMemorySize).
++std::uint64_t TotalMemorySize();
++
++/// Memoria ya usada por el proceso (svcGetInfo UsedMemorySize).
++std::uint64_t UsedMemorySize();
++
++/// Cambia la prioridad del hilo actual. Horizon: número menor = más prioridad.
++void SetCurrentThreadPriority(int horizon_priority);
++
++/// Núcleos en los que puede correr el proceso.
++int CoreCount();
++
++} // namespace Common::Horizon
++
++#endif // __SWITCH2__
 diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
 index 75a9da8..b917d14 100644
 --- a/src/common/host_memory.cpp
@@ -319,7 +639,7 @@ index a7fd053..db06e04 100644
      class Impl;
      std::unique_ptr<Impl> impl;
 diff --git a/src/common/memory_detect.cpp b/src/common/memory_detect.cpp
-index 86a3abc..2de08bd 100644
+index 86a3abc..be74008 100644
 --- a/src/common/memory_detect.cpp
 +++ b/src/common/memory_detect.cpp
 @@ -12,6 +12,8 @@
@@ -327,23 +647,376 @@ index 86a3abc..2de08bd 100644
  #elif defined(__linux__)
  #include <sys/sysinfo.h>
 +#elif defined(__SWITCH2__)
-+#include <switch.h>
++#include "common/horizon/horizon_os.h"
  #else
  #include <unistd.h>
  #endif
-@@ -56,6 +58,12 @@ static MemoryInfo Detect() {
+@@ -56,6 +58,10 @@ static MemoryInfo Detect() {
      sysinfo(&meminfo);
      mem_info.TotalPhysicalMemory = meminfo.totalram;
      mem_info.TotalSwapMemory = meminfo.totalswap;
 +#elif defined(__SWITCH2__)
 +    // Memoria que el kernel concede a este proceso (el pool del juego anfitrión).
-+    u64 total = 0;
-+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-+    mem_info.TotalPhysicalMemory = total;
++    mem_info.TotalPhysicalMemory = Common::Horizon::TotalMemorySize();
 +    mem_info.TotalSwapMemory = 0;
  #else
      mem_info.TotalPhysicalMemory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
      mem_info.TotalSwapMemory = 0;
+diff --git a/src/common/multi_level_page_table.h b/src/common/multi_level_page_table.h
+index 31f6676..103733f 100644
+--- a/src/common/multi_level_page_table.h
++++ b/src/common/multi_level_page_table.h
+@@ -30,7 +30,12 @@ public:
+           first_level_shift{std::exchange(other.first_level_shift, 0)},
+           first_level_chunk_size{std::exchange(other.first_level_chunk_size, 0)},
+           first_level_map{std::move(other.first_level_map)}, base_ptr{std::exchange(other.base_ptr,
+-                                                                                    nullptr)} {}
++                                                                                    nullptr)}
++#ifdef __SWITCH2__
++          , chunk_entry_bits{std::exchange(other.chunk_entry_bits, 0)}
++          , chunk_entry_mask{std::exchange(other.chunk_entry_mask, 0)}
++#endif
++          {}
+ 
+     MultiLevelPageTable& operator=(MultiLevelPageTable&& other) noexcept {
+         address_space_bits = std::exchange(other.address_space_bits, 0);
+@@ -41,11 +46,35 @@ public:
+         alloc_size = std::exchange(other.alloc_size, 0);
+         first_level_map = std::move(other.first_level_map);
+         base_ptr = std::exchange(other.base_ptr, nullptr);
++#ifdef __SWITCH2__
++        chunk_entry_bits = std::exchange(other.chunk_entry_bits, 0);
++        chunk_entry_mask = std::exchange(other.chunk_entry_mask, 0);
++#endif
+         return *this;
+     }
+ 
+     void ReserveRange(u64 start, std::size_t size);
+ 
++#ifdef __SWITCH2__
++    // Horizon no tiene reservas perezosas: en vez de un bloque contiguo de hasta 1 GiB,
++    // cada trozo de primer nivel se pide al heap cuando se reserva (ReserveRange).
++    [[nodiscard]] const BaseAddr& operator[](std::size_t index) const {
++        static const BaseAddr zero{};
++        const std::size_t level = index >> chunk_entry_bits;
++        if (level >= first_level_map.size() || !first_level_map[level]) {
++            return zero;
++        }
++        return static_cast<const BaseAddr*>(first_level_map[level])[index & chunk_entry_mask];
++    }
++
++    [[nodiscard]] BaseAddr& operator[](std::size_t index) {
++        const std::size_t level = index >> chunk_entry_bits;
++        if (!first_level_map[level]) {
++            AllocateLevel(level);
++        }
++        return static_cast<BaseAddr*>(first_level_map[level])[index & chunk_entry_mask];
++    }
++#else
+     [[nodiscard]] const BaseAddr& operator[](std::size_t index) const {
+         return base_ptr[index];
+     }
+@@ -53,6 +82,7 @@ public:
+     [[nodiscard]] BaseAddr& operator[](std::size_t index) {
+         return base_ptr[index];
+     }
++#endif
+ 
+     [[nodiscard]] BaseAddr* data() {
+         return base_ptr;
+@@ -73,6 +103,10 @@ private:
+     std::size_t alloc_size{};
+     std::vector<void*> first_level_map{};
+     BaseAddr* base_ptr{};
++#ifdef __SWITCH2__
++    std::size_t chunk_entry_bits{};
++    std::size_t chunk_entry_mask{};
++#endif
+ };
+ 
+ } // namespace Common
+diff --git a/src/common/multi_level_page_table.inc b/src/common/multi_level_page_table.inc
+index 79125e8..76f7563 100644
+--- a/src/common/multi_level_page_table.inc
++++ b/src/common/multi_level_page_table.inc
+@@ -3,6 +3,8 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#elif defined(__SWITCH2__)
++#include <cstdlib>
+ #else
+ #include <sys/mman.h>
+ #endif
+@@ -26,6 +28,11 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
+     alloc_size = (1ULL << (address_space_bits - page_bits)) * sizeof(BaseAddr);
+     std::size_t first_level_size = 1ULL << first_level_bits;
+     first_level_map.resize(first_level_size, nullptr);
++#if defined(__SWITCH2__)
++    // Sin bloque contiguo: los trozos se crean en AllocateLevel (ver el header).
++    chunk_entry_bits = first_level_shift - page_bits;
++    chunk_entry_mask = (std::size_t{1} << chunk_entry_bits) - 1;
++#else
+ #ifdef _WIN32
+     void* base{VirtualAlloc(nullptr, alloc_size, MEM_RESERVE, PAGE_READWRITE)};
+ #else
+@@ -35,10 +42,16 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
+ #endif
+     ASSERT(base);
+     base_ptr = reinterpret_cast<BaseAddr*>(base);
++#endif
+ }
+ 
+ template <typename BaseAddr>
+ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
++#if defined(__SWITCH2__)
++    for (void* chunk : first_level_map) {
++        std::free(chunk);
++    }
++#else
+     if (!base_ptr) {
+         return;
+     }
+@@ -47,6 +60,7 @@ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
+ #else
+     ASSERT(munmap(base_ptr, alloc_size) == 0);
+ #endif
++#endif
+ }
+ 
+ template <typename BaseAddr>
+@@ -60,6 +74,11 @@ void MultiLevelPageTable<BaseAddr>::ReserveRange(u64 start, std::size_t size) {
+ 
+ template <typename BaseAddr>
+ void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
++#ifdef __SWITCH2__
++    void* base = std::calloc(1, first_level_chunk_size);
++    ASSERT(base);
++    first_level_map[index] = base;
++#else
+     void* ptr = reinterpret_cast<char *>(base_ptr) + index * first_level_chunk_size;
+ #ifdef _WIN32
+     void* base = VirtualAlloc(ptr, first_level_chunk_size, MEM_COMMIT, PAGE_READWRITE);
+@@ -68,6 +87,7 @@ void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
+     void* base = ptr;
+ #endif
+     first_level_map[index] = base;
++#endif
+ }
+ 
+ } // namespace Common
+diff --git a/src/common/net/net.cpp b/src/common/net/net.cpp
+index 22a757d..41c85b5 100644
+--- a/src/common/net/net.cpp
++++ b/src/common/net/net.cpp
+@@ -1,6 +1,43 @@
+ // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#ifdef __SWITCH2__
++
++// Switch 2: sin HTTP (hydrocarbon no soporta Horizon). Todo devuelve "sin datos",
++// igual que si no hubiera conexión; nadie en el núcleo depende de estas respuestas.
++#include "common/net/net.h"
++
++namespace Common::Net {
++
++std::vector<NamedAsset> GetPlatformAssets(const Release&) {
++    return {};
++}
++std::optional<std::string> MakeRequest(const std::string&) {
++    return std::nullopt;
++}
++std::optional<std::string> MakeRequest(const std::string_view) {
++    return std::nullopt;
++}
++std::vector<Release> GetReleases() {
++    return {};
++}
++std::optional<Release> GetLatestRelease() {
++    return std::nullopt;
++}
++std::optional<std::string> GetReleasesBody() {
++    return std::nullopt;
++}
++std::vector<Release> GetReleasesFromJson(const std::string&) {
++    return {};
++}
++bool HeadRequest(const std::string&) {
++    return false;
++}
++
++} // namespace Common::Net
++
++#else // __SWITCH2__
++
+ #include <optional>
+ #include <utility>
+ 
+@@ -203,3 +240,5 @@ bool HeadRequest(const std::string& url) {
+ }
+ 
+ } // namespace Common::Net
++
++#endif // __SWITCH2__
+diff --git a/src/common/sparse_large_vector.cpp b/src/common/sparse_large_vector.cpp
+index 796bae9..7f76f90 100644
+--- a/src/common/sparse_large_vector.cpp
++++ b/src/common/sparse_large_vector.cpp
+@@ -9,6 +9,9 @@
+ #include <algorithm>
+ #include <windows.h>
+ #include <mutex>
++#elif defined(__SWITCH2__)
++#include <cstdlib>
++#include <cstring>
+ #else
+ #include <sys/mman.h>
+ #endif
+@@ -106,16 +109,20 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
+ }
+ #endif
+ 
++#ifndef __SWITCH2__
+ #ifndef MAP_NOCORE
+ #define MAP_NOCORE 0
+ #endif
+ #ifndef MADV_FREE
+ #define MADV_FREE MADV_DONTNEED
+ #endif
++#endif
+ 
+ void DecommitVectorPage(uintptr_t base) noexcept {
+ #if defined(_WIN32)
+     VirtualFree(reinterpret_cast<LPVOID>(base), HostPageSize, MEM_DECOMMIT);
++#elif defined(__SWITCH2__)
++    std::memset(reinterpret_cast<void*>(base), 0, HostPageSize);
+ #elif defined(__linux__)
+     // Linux's MADV_DONTNEED zeros out pages for us
+     madvise(reinterpret_cast<void*>(base), HostPageSize, MADV_DONTNEED);
+@@ -147,6 +154,12 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
+         base = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+     }
+     ASSERT_MSG(base, "Failed to reserve {:#x} sized region with error {}", size, GetLastError());
++#elif defined(__SWITCH2__)
++    // Sin reserva perezosa en Horizon: se paga toda la memoria por adelantado.
++    // La tabla de páginas de un invitado de 39 bits son 1 GiB (2^27 entradas x 8 bytes).
++    void* base = std::aligned_alloc(HostPageSize, size);
++    ASSERT_MSG(base, "No hay memoria para un vector de {:#x} bytes", size);
++    std::memset(base, 0, size);
+ #else
+     void* base = mmap(nullptr, size, PROT_READ, MAP_ANON | MAP_PRIVATE | MAP_NOCORE, -1, 0);
+     if (base == MAP_FAILED)
+@@ -166,6 +179,8 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
+     std::lock_guard lock(vector_regions_mutex);
+     std::erase_if(vector_regions, [base](const auto& r) {return r.first == reinterpret_cast<u64>(base); });
+     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
++#elif defined(__SWITCH2__)
++    std::free(base);
+ #else
+     ASSERT(munmap(base, size) == 0);
+ #endif
+diff --git a/src/common/sparse_large_vector.h b/src/common/sparse_large_vector.h
+index 8496c28..b583903 100644
+--- a/src/common/sparse_large_vector.h
++++ b/src/common/sparse_large_vector.h
+@@ -12,7 +12,7 @@
+ #include <utility>
+ #include <vector>
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__SWITCH2__)
+ #include <unistd.h>
+ #include <sys/mman.h>
+ #endif
+@@ -22,11 +22,13 @@
+ 
+ namespace Common {
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__SWITCH2__)
+ constexpr u64 HostPageSize = 0x1000;
+ constexpr u64 HostPageBits = 12;
+ constexpr u64 HostPageMask = ~(HostPageSize - 1);
++#ifdef _WIN32
+ bool CommitVectorPage(uintptr_t addr, bool write) noexcept;
++#endif
+ #else
+ inline const u64 HostPageSize = sysconf(_SC_PAGESIZE);
+ inline const u64 HostPageBits = std::countr_zero(HostPageSize);
+@@ -183,6 +185,9 @@ private:
+         if (!CommitVectorPage(page, true)) {
+             return false;
+         }
++#elif defined(__SWITCH2__)
++        // Horizon no tiene páginas perezosas: todo el vector ya está reservado y a cero.
++        (void)page;
+ #else
+         if (mprotect(reinterpret_cast<void*>(page), HostPageSize, PROT_READ | PROT_WRITE) != 0) {
+             LOG_ERROR(Common_Memory, "Failed to commit large buffer region at index {}, error {}", index, strerror(errno));
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3..4a7c8d4 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -15,6 +15,9 @@
+ #include "common/logging.h"
+ #include "common/assert.h"
+ #include "common/thread.h"
++#ifdef __SWITCH2__
++#include "common/horizon/horizon_os.h"
++#endif
+ #ifdef __APPLE__
+ #include <mach/mach.h>
+ #elif defined(__HAIKU__)
+@@ -484,6 +487,19 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
+         return;
+     }
+     RememberCurrentThreadNice(tid, nice_value);
++#elif defined(__SWITCH2__)
++    // Horizon: rango de aplicación 0x18..0x3F, menor = más prioridad; 0x2C es el normal.
++    const int horizon_priority = [&]() {
++        switch (new_priority) {
++        case ThreadPriority::Low: return 0x2E;
++        case ThreadPriority::Normal: return 0x2C;
++        case ThreadPriority::High: return 0x2B;
++        case ThreadPriority::VeryHigh: return 0x2A;
++        case ThreadPriority::Critical: return 0x28;
++        default: return 0x2C;
++        }
++    }();
++    Common::Horizon::SetCurrentThreadPriority(horizon_priority);
+ #elif defined(__linux__)
+     const int nice_value = NiceValueForPriority(new_priority);
+     if (setpriority(PRIO_PROCESS, 0, nice_value) != 0) {
+@@ -529,8 +545,9 @@ void SetCurrentThreadName(const char* name) {
+         buf[len] = '\0';
+         pthread_setname_np(pthread_self(), buf);
+     }
+-#elif defined(_WIN32)
+-    // MinGW with the POSIX threading model does not support pthread_setname_np
++#elif defined(_WIN32) || defined(__SWITCH2__)
++    // MinGW with the POSIX threading model does not support pthread_setname_np.
++    // Horizon no tiene nombres de hilo.
+     // See for reference
+     // https://gitlab.freedesktop.org/mesa/mesa/-/blame/main/src/util/u_thread.c?ref_type=heads#L75
+     (void)name;
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 6995333..f7ecfb6 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -1215,7 +1215,11 @@ if (MSVC)
+ endif()
+ 
+ if (BOOST_NO_HEADERS)
+-    target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
++    if (NINTENDO_SWITCH2)
++        target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::crc)
++    else()
++        target_link_libraries(core PUBLIC Boost::container Boost::heap Boost::asio Boost::process Boost::crc)
++    endif()
+ else()
+     target_link_libraries(core PUBLIC Boost::headers)
+ endif()
 diff --git a/src/core/arm/dynarmic/arm_dynarmic_32.cpp b/src/core/arm/dynarmic/arm_dynarmic_32.cpp
 index 28c731f..0f7ced8 100644
 --- a/src/core/arm/dynarmic/arm_dynarmic_32.cpp
@@ -378,6 +1051,124 @@ index b4d18d3..f91577e 100644
      config.code_cache_size = std::uint32_t(128_MiB);
  #else
      config.code_cache_size = std::uint32_t(512_MiB);
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index f954fee..bb08768 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -18,6 +18,7 @@
+ #include "common/string_util.h"
+ #include "core/arm/exclusive_monitor.h"
+ #include "core/core.h"
++#include "common/horizon/breadcrumb.h"
+ 
+ #include "launch_timestamp_cache.h"
+ #include "core/core_timing.h"
+@@ -274,15 +275,20 @@ struct System::Impl {
+     }
+ 
+     SystemResultStatus SetupForApplicationProcess(System& system, Frontend::EmuWindow& emu_window) {
++        EDEN_CRUMB("Setup: host1x");
+         host1x_core.emplace(system);
++        EDEN_CRUMB("Setup: creando GPU (renderer Vulkan)");
+         VideoCore::CreateGPU(gpu_core, emu_window, system);
+         if (!gpu_core)
+             return SystemResultStatus::ErrorVideoCore;
+ 
++        EDEN_CRUMB("Setup: audio_core");
+         audio_core.emplace(system);
+ 
++        EDEN_CRUMB("Setup: servicios HLE");
+         service_manager = std::make_shared<Service::SM::ServiceManager>(kernel);
+         services.emplace(service_manager, system, stop_event.get_token());
++        EDEN_CRUMB("Setup: servicios HLE listos");
+ 
+         is_powered_on = true;
+         exit_locked = false;
+@@ -302,6 +308,7 @@ struct System::Impl {
+             fs_controller.InitTempStorage();
+         }
+ 
++        EDEN_CRUMB("Load: kernel");
+         InitializeKernel(system);
+ 
+         if (params.applet_type == Service::AM::AppletType::Application) {
+@@ -313,7 +320,9 @@ struct System::Impl {
+         // Create the application process
+         Loader::ResultStatus load_result{};
+         std::vector<u8> control;
++        EDEN_CRUMB("Load: creando proceso del juego");
+         auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
++        EDEN_CRUMB("Load: proceso creado");
+         if (load_result != Loader::ResultStatus::Success) {
+             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
+             ShutdownMainProcess();
+@@ -353,11 +362,14 @@ struct System::Impl {
+             return init_result;
+         }
+         // Waiting for GPU before initializing CPU
++        EDEN_CRUMB("Load: CpuManager::Initialize (hilos de CPU)");
+         cpu_manager.Initialize();
+ 
+         // Register with applet manager
+         // All threads are started, begin main process execution, now that we're in the clear
++        EDEN_CRUMB("Load: applet manager");
+         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
++        EDEN_CRUMB("Load: applet registrado");
+ 
+         if (Settings::values.gamecard_inserted) {
+             if (Settings::values.gamecard_current_game) {
+@@ -381,6 +393,7 @@ struct System::Impl {
+             LOG_ERROR(Core, "Failed to find program id for ROM");
+         }
+ 
++        EDEN_CRUMB("Load: ajustes por juego");
+         GameSettings::LoadOverrides(program_id, gpu_core->Renderer());
+         if (auto room_member = Network::GetRoomMember().lock()) {
+             Network::GameInfo game_info;
+diff --git a/src/core/debugger/debugger.cpp b/src/core/debugger/debugger.cpp
+index 7c887ad..8b9f1d9 100644
+--- a/src/core/debugger/debugger.cpp
++++ b/src/core/debugger/debugger.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#ifndef __SWITCH2__
++
+ #include <mutex>
+ #include <utility>
+ #include <type_traits>
+@@ -400,3 +402,30 @@ void Debugger::NotifyShutdown() {
+ }
+ 
+ } // namespace Core
++
++#else // __SWITCH2__
++
++// En Switch 2 no hay depurador GDB: necesita Boost.Asio + Boost.Process (pipes POSIX).
++// Esta versión vacía mantiene la interfaz para que el núcleo compile sin cambios.
++#include "core/debugger/debugger.h"
++
++namespace Core {
++
++class DebuggerImpl {};
++
++Debugger::Debugger(Core::System&, u16) {}
++Debugger::~Debugger() = default;
++
++bool Debugger::NotifyThreadStopped(Kernel::KThread*) {
++    return false;
++}
++
++bool Debugger::NotifyThreadWatchpoint(Kernel::KThread*, const Kernel::DebugWatchpoint&) {
++    return false;
++}
++
++void Debugger::NotifyShutdown() {}
++
++} // namespace Core
++
++#endif // __SWITCH2__
 diff --git a/src/core/frontend/emu_window.h b/src/core/frontend/emu_window.h
 index ee7a769..2515a51 100644
 --- a/src/core/frontend/emu_window.h
@@ -390,6 +1181,212 @@ index ee7a769..2515a51 100644
  };
  
  /**
+diff --git a/src/core/hle/service/bcat/news/builtin_news.cpp b/src/core/hle/service/bcat/news/builtin_news.cpp
+index 79fde93..8ae027a 100644
+--- a/src/core/hle/service/bcat/news/builtin_news.cpp
++++ b/src/core/hle/service/bcat/news/builtin_news.cpp
+@@ -290,6 +290,16 @@ static inline u64 ParseIsoTimestamp(const std::string& iso) {
+ 
+ #ifdef _WIN32
+     return static_cast<u64>(_mkgmtime(&tm));
++#elif defined(__SWITCH2__)
++    // newlib no tiene timegm: segundos desde 1970 en UTC (algoritmo days_from_civil).
++    const long long y = static_cast<long long>(tm.tm_year) + 1900 - (tm.tm_mon < 2 ? 1 : 0);
++    const long long era = (y >= 0 ? y : y - 399) / 400;
++    const long long yoe = y - era * 400;
++    const long long m = tm.tm_mon + 1;
++    const long long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + tm.tm_mday - 1;
++    const long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    const long long days = era * 146097 + doe - 719468;
++    return static_cast<u64>(days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec);
+ #else
+     return static_cast<u64>(timegm(&tm));
+ #endif
+diff --git a/src/core/hle/service/services.cpp b/src/core/hle/service/services.cpp
+index b90af96..c6e4645 100644
+--- a/src/core/hle/service/services.cpp
++++ b/src/core/hle/service/services.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "core/hle/service/services.h"
++#include "common/horizon/breadcrumb.h"
+ 
+ #include "core/hle/service/acc/acc.h"
+ #include "core/hle/service/am/am.h"
+@@ -75,6 +76,7 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+                    std::stop_token token) {
+     auto& kernel = system.Kernel();
+ 
++    EDEN_CRUMB("Servicios: fábricas de FS");
+     system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
+ 
+     // Just a quick C++ lesson
+@@ -95,7 +97,14 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+         {"nvservices", &Nvidia::LoopProcess},
+         {"bsdsocket",  &Sockets::LoopProcess},
+     })
+-        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }).detach();
++    {
++        EDEN_CRUMB_NAMED("Servicios (hilo propio): lanzando ", e.first);
++        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second, n = e.first] {
++            EDEN_CRUMB_NAMED("Servicios (hilo propio): corriendo ", n);
++            f(system);
++        }).detach();
++    }
++    EDEN_CRUMB("Servicios (hilo propio): lanzando vi");
+     kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
+     // Avoid cold clones of lambdas -- succintly
+     for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
+@@ -154,7 +163,11 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+         {"i2c",        &I2C::LoopProcess},
+         {"gpio",        &GPIO::LoopProcess},
+     })
++    {
++        EDEN_CRUMB_NAMED("Servicios (núcleo invitado): ", e.first);
+         kernel.RunOnGuestCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); });
++    }
++    EDEN_CRUMB("Servicios: todos registrados");
+ }
+ 
+ } // namespace Service
+diff --git a/src/core/hle/service/set/system_settings_server.cpp b/src/core/hle/service/set/system_settings_server.cpp
+index 52642e3..73dabfe 100644
+--- a/src/core/hle/service/set/system_settings_server.cpp
++++ b/src/core/hle/service/set/system_settings_server.cpp
+@@ -471,7 +471,20 @@ bool ISystemSettingsServer::StoreSettingsFile(std::filesystem::path& path, auto&
+     }
+     file.close();
+ 
+-    std::filesystem::rename(settings_tmp_file, settings_base.replace_extension("dat"));
++    const auto settings_dat_file = settings_base.replace_extension("dat");
++    std::error_code ec;
++    std::filesystem::rename(settings_tmp_file, settings_dat_file, ec);
++    if (ec) {
++        // En la SD de Switch (FAT/exFAT vía libnx) renombrar no sobrescribe el destino:
++        // se borra el .dat viejo y se reintenta, en vez de lanzar una excepción.
++        std::filesystem::remove(settings_dat_file, ec);
++        ec.clear();
++        std::filesystem::rename(settings_tmp_file, settings_dat_file, ec);
++        if (ec) {
++            LOG_ERROR(Service_SET, "Failed to save {}: {}", settings_dat_file.string(), ec.message());
++            return false;
++        }
++    }
+ 
+     return true;
+ }
+diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
+index 01d37fb..1fbaefa 100644
+--- a/src/core/internal_network/network.cpp
++++ b/src/core/internal_network/network.cpp
+@@ -178,6 +178,58 @@ constexpr int SD_BOTH = SHUT_RDWR;
+ 
+ int interrupt_pipe_fd[2] = {-1, -1};
+ 
++#ifdef __SWITCH2__
++// Horizon no tiene pipe(): el "pipe" de interrupción es un socket UDP en 127.0.0.1.
++// [0] recibe (es lo que se mete en poll) y [1] envía un byte a [0] para despertarlo.
++sockaddr_in interrupt_addr{};
++
++void Initialize() {
++    interrupt_pipe_fd[0] = socket(AF_INET, SOCK_DGRAM, 0);
++    interrupt_pipe_fd[1] = socket(AF_INET, SOCK_DGRAM, 0);
++    if (interrupt_pipe_fd[0] < 0 || interrupt_pipe_fd[1] < 0) {
++        LOG_ERROR(Network, "Failed to create interrupt sockets (¿sockets sin inicializar?)");
++        return;
++    }
++    interrupt_addr.sin_family = AF_INET;
++    interrupt_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    interrupt_addr.sin_port = 0;
++    socklen_t len = sizeof(interrupt_addr);
++    if (bind(interrupt_pipe_fd[0], reinterpret_cast<sockaddr*>(&interrupt_addr), len) != 0 ||
++        getsockname(interrupt_pipe_fd[0], reinterpret_cast<sockaddr*>(&interrupt_addr), &len) != 0) {
++        LOG_ERROR(Network, "Failed to bind interrupt socket");
++    }
++    int flags = fcntl(interrupt_pipe_fd[0], F_GETFL);
++    fcntl(interrupt_pipe_fd[0], F_SETFL, flags | O_NONBLOCK);
++}
++
++void Finalize() {
++    for (int& fd : interrupt_pipe_fd) {
++        if (fd >= 0) {
++            close(fd);
++            fd = -1;
++        }
++    }
++}
++
++void InterruptSocketOperations() {
++    if (interrupt_pipe_fd[1] < 0) {
++        return;
++    }
++    u8 value = 0;
++    sendto(interrupt_pipe_fd[1], &value, sizeof(value), 0,
++           reinterpret_cast<const sockaddr*>(&interrupt_addr), sizeof(interrupt_addr));
++}
++
++void AcknowledgeInterrupt() {
++    if (interrupt_pipe_fd[0] < 0) {
++        return;
++    }
++    u8 value = 0;
++    recv(interrupt_pipe_fd[0], &value, sizeof(value), 0);
++}
++
++#else
++
+ void Initialize() {
+     if (pipe(interrupt_pipe_fd) != 0) {
+         LOG_ERROR(Network, "Failed to create interrupt pipe!");
+@@ -209,6 +261,8 @@ void AcknowledgeInterrupt() {
+     }
+ }
+ 
++#endif // __SWITCH2__
++
+ SOCKET GetInterruptSocket() {
+     return interrupt_pipe_fd[0];
+ }
+diff --git a/src/core/internal_network/socket_proxy.cpp b/src/core/internal_network/socket_proxy.cpp
+index 744765b..7dc0e1a 100644
+--- a/src/core/internal_network/socket_proxy.cpp
++++ b/src/core/internal_network/socket_proxy.cpp
+@@ -14,8 +14,8 @@
+ #include "core/internal_network/socket_proxy.h"
+ #include "network/network.h"
+ 
+-#ifdef __unix__
+-#include <sys/socket.h>
++#if defined(__unix__) || defined(__SWITCH2__)
++#include <sys/socket.h> // en Switch 2, el de libounce (sockets BSD)
+ #endif
+ 
+ namespace Network {
+diff --git a/src/core/tools/renderdoc.cpp b/src/core/tools/renderdoc.cpp
+index 6a6df23..32f1063 100644
+--- a/src/core/tools/renderdoc.cpp
++++ b/src/core/tools/renderdoc.cpp
+@@ -12,7 +12,7 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+-#else
++#elif !defined(__SWITCH2__)
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -28,8 +28,8 @@ RenderdocAPI::RenderdocAPI() {
+             ASSERT(ret == 1);
+         }
+     }
+-#elif defined(__HAIKU__)
+-    // no rtld on haiku
++#elif defined(__HAIKU__) || defined(__SWITCH2__)
++    // no rtld on haiku (ni en Horizon)
+ #else
+ #ifdef __ANDROID__
+     static constexpr const char RENDERDOC_LIB[] = "libVkLayer_GLES_RenderDoc.so";
 diff --git a/src/dynarmic/src/dynarmic/CMakeLists.txt b/src/dynarmic/src/dynarmic/CMakeLists.txt
 index 72cc05e..ced7db8 100644
 --- a/src/dynarmic/src/dynarmic/CMakeLists.txt
@@ -547,10 +1544,10 @@ index 755b05b..0af6999 100644
      // A IR::LocationDescriptor will have one current CodePtr.
 diff --git a/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
 new file mode 100644
-index 0000000..d33116b
+index 0000000..624c889
 --- /dev/null
 +++ b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,124 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -559,13 +1556,40 @@ index 0000000..d33116b
 +#include "dynarmic/backend/arm64/horizon_code_block.h"
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cstddef>
++#include <cstdio>
 +#include <new>
 +
 +#include <switch.h>
 +#include <kaihen.h>
 +
++extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
++
++// Estadísticas del JIT para el frontend (latidos de crash.txt): cuántas publicaciones
++// por IPC a kaiHEN, cuántos bytes y cuánto tiempo se fue en ellas.
++namespace {
++std::atomic<std::uint64_t> g_publish_count{0};
++std::atomic<std::uint64_t> g_publish_bytes{0};
++std::atomic<std::uint64_t> g_publish_ns{0};
++} // namespace
++
++extern "C" void eden_ounce_jit_stats(std::uint64_t* count, std::uint64_t* bytes,
++                                     std::uint64_t* ns) {
++    *count = g_publish_count.load(std::memory_order_relaxed);
++    *bytes = g_publish_bytes.load(std::memory_order_relaxed);
++    *ns = g_publish_ns.load(std::memory_order_relaxed);
++}
++
 +namespace Dynarmic::Backend::Arm64 {
++
++namespace {
++void Crumb(const char* text) {
++    if (eden_ounce_breadcrumb) {
++        eden_ounce_breadcrumb(text);
++    }
++}
++} // namespace
 +
 +static_assert(sizeof(HorizonCodeBlock::Range) == sizeof(KaihenJitRange));
 +static_assert(offsetof(HorizonCodeBlock::Range, offset) == offsetof(KaihenJitRange, offset));
@@ -577,8 +1601,18 @@ index 0000000..d33116b
 +
 +HorizonCodeBlock::HorizonCodeBlock(std::size_t size)
 +        : m_impl{std::make_unique<Impl>()}, m_size{size} {
-+    if (R_FAILED(jitCreate(&m_impl->jit, size))) {
++    const Result rc = jitCreate(&m_impl->jit, size);
++    if (R_FAILED(rc)) {
++        char text[96];
++        std::snprintf(text, sizeof(text), "JIT kaiHEN: jitCreate(%zu MiB) falló, Result 0x%X",
++                      size >> 20, rc);
++        Crumb(text);
 +        throw std::bad_alloc{};
++    }
++    {
++        char text[96];
++        std::snprintf(text, sizeof(text), "JIT kaiHEN: bloque de %zu MiB creado", size >> 20);
++        Crumb(text);
 +    }
 +    m_w = static_cast<std::uint32_t*>(jitGetRwAddr(&m_impl->jit));
 +    m_x = static_cast<std::uint32_t*>(jitGetRxAddr(&m_impl->jit));
@@ -615,8 +1649,21 @@ index 0000000..d33116b
 +    }
 +    m_dirty.resize(out + 1);
 +
++    static bool first_publish = true;
++    if (first_publish) {
++        first_publish = false;
++        Crumb("JIT kaiHEN: primera publicación de código");
++    }
++    std::uint64_t bytes = 0;
++    for (const Range& r : m_dirty) {
++        bytes += r.size;
++    }
++    const u64 t0 = armGetSystemTick();
 +    const Result rc = kaihenJitPublishRanges(
 +        &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
++    g_publish_ns.fetch_add(armTicksToNs(armGetSystemTick() - t0), std::memory_order_relaxed);
++    g_publish_count.fetch_add(1, std::memory_order_relaxed);
++    g_publish_bytes.fetch_add(bytes, std::memory_order_relaxed);
 +    if (R_FAILED(rc)) {
 +        // Sin publicación el invitado ejecutaría código viejo: mejor abortar ya.
 +        diagAbortWithResult(rc);
@@ -770,10 +1817,10 @@ index 7833b65..d63cf87 100644
  }  // namespace Dynarmic
 diff --git a/src/eden_ounce/CMakeLists.txt b/src/eden_ounce/CMakeLists.txt
 new file mode 100644
-index 0000000..f70c16b
+index 0000000..63c8672
 --- /dev/null
 +++ b/src/eden_ounce/CMakeLists.txt
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,53 @@
 +# SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -806,6 +1853,17 @@ index 0000000..f70c16b
 +# kaihenJitPublishRanges; debe ir antes de libounce (-lnx) en la línea de enlace.
 +target_link_libraries(eden-ounce PRIVATE vulkan kaihen)
 +
++# Diagnóstico: abort/assert/diagAbortWithResult/fatalThrow/svcBreak pasan por
++# horizon.cpp antes de cerrar el proceso, para que crash.txt diga por qué.
++# -fno-omit-frame-pointer en el frontend no basta para toda la pila, pero ayuda.
++target_link_options(eden-ounce PRIVATE
++    "LINKER:--wrap=abort,--wrap=__assert_func,--wrap=diagAbortWithResult,--wrap=fatalThrow,--wrap=svcBreak")
++# libounce no implementa pthread_detach: ver __wrap_pthread_detach en horizon.cpp.
++target_link_options(eden-ounce PRIVATE "LINKER:--wrap=pthread_detach")
++
++# Al final de todo: zlib para las bibliotecas estáticas de FFmpeg (uncompress).
++target_link_libraries(eden-ounce PRIVATE -lz)
++
 +nx_generate_nacp(eden-ounce.nacp
 +    NAME    "Eden"
 +    AUTHOR  "Eden Emulator Project (port Ounce)"
@@ -816,6 +1874,48 @@ index 0000000..f70c16b
 +    OUTPUT ${CMAKE_BINARY_DIR}/eden.nro
 +    NACP   eden-ounce.nacp   # icono por defecto de libounce
 +)
+diff --git a/src/eden_ounce/compat/sys/resource.h b/src/eden_ounce/compat/sys/resource.h
+new file mode 100644
+index 0000000..413de20
+--- /dev/null
++++ b/src/eden_ounce/compat/sys/resource.h
+@@ -0,0 +1,36 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Shim de <sys/resource.h> para Horizon, solo para Boost.Context
++// (stack_traits.cpp pregunta el límite de pila con getrlimit).
++// newlib trae un sys/resource.h sin rlimit; en Horizon la pila no tiene límite
++// impuesto por el sistema: el tamaño lo fija quien crea el hilo o la fibra.
++
++#pragma once
++
++#include <sys/types.h>
++
++typedef unsigned long rlim_t;
++
++#define RLIM_INFINITY (~(rlim_t)0)
++#define RLIMIT_STACK 3
++
++struct rlimit {
++    rlim_t rlim_cur;
++    rlim_t rlim_max;
++};
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++static inline int getrlimit(int resource, struct rlimit* limit) {
++    (void)resource;
++    limit->rlim_cur = RLIM_INFINITY;
++    limit->rlim_max = RLIM_INFINITY;
++    return 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
 diff --git a/src/eden_ounce/emu_window_ounce.cpp b/src/eden_ounce/emu_window_ounce.cpp
 new file mode 100644
 index 0000000..32f2c0a
@@ -970,18 +2070,178 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..5d9c469
+index 0000000..a44177f
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,309 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
 +// Implementación de horizon.h. Este archivo incluye <switch.h> y NINGÚN header de Eden.
 +
++#include <cstdio>
++#include <ctime>
++
++#include <malloc.h>
++#include <unistd.h>
++#include <pthread.h>
++
 +#include <switch.h>
 +
 +#include "eden_ounce/horizon.h"
++
++// ---------------------------------------------------------------- fallos de CPU
++// libnx llama a __libnx_exception_handler (en su propia pila) cuando un hilo de este
++// proceso provoca una excepción de CPU. Escribimos lo esencial y dejamos que el
++// proceso termine (vuelve al hbmenu).
++extern "C" {
++alignas(16) u8 __nx_exception_stack[0x8000];
++u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
++extern char __start__; // base de eden.nro (crt0 de libnx)
++extern char* fake_heap_start; // heap de newlib (lo fija libnx al arrancar)
++extern char* fake_heap_end;
++}
++
++namespace {
++constexpr const char* kCrashPath = "sdmc:/switch/eden/log/crash.txt";
++
++const char* DescribeException(u32 desc) {
++    switch (desc) {
++    case ThreadExceptionDesc_InstructionAbort: return "InstructionAbort";
++    case ThreadExceptionDesc_MisalignedPC: return "MisalignedPC";
++    case ThreadExceptionDesc_MisalignedSP: return "MisalignedSP";
++    case ThreadExceptionDesc_SError: return "SError";
++    case ThreadExceptionDesc_BadSVC: return "BadSVC";
++    case ThreadExceptionDesc_Trap: return "Trap (instrucción ilegal / brk)";
++    case ThreadExceptionDesc_Other: return "Other (data abort u otro)";
++    default: return "?";
++    }
++}
++u64 NroOffset(u64 addr) {
++    const u64 base = reinterpret_cast<u64>(&__start__);
++    return addr >= base ? addr - base : 0;
++}
++
++// Pila de llamadas siguiendo los frame pointers (solo direcciones dentro de eden.nro).
++void DumpBacktrace(FILE* f, u64 fp) {
++    const u64 base = reinterpret_cast<u64>(&__start__);
++    std::fprintf(f, "Llamadas:\n");
++    for (int depth = 0; depth < 32 && fp != 0 && (fp & 0xF) == 0; ++depth) {
++        const u64* frame = reinterpret_cast<const u64*>(fp);
++        const u64 ret = frame[1];
++        if (ret < base) {
++            break;
++        }
++        std::fprintf(f, "  #%02d eden.nro+0x%lX\n", depth, ret - base);
++        if (frame[0] <= fp) {
++            break;
++        }
++        fp = frame[0];
++    }
++    std::fprintf(f, "\n");
++}
++} // namespace
++
++extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (!f) {
++        return;
++    }
++    const u64 base = reinterpret_cast<u64>(&__start__);
++    const auto off = [base](u64 a) { return a >= base ? a - base : 0; };
++    std::fprintf(f, "=== Fallo de CPU (%s, desc=0x%X) ===\n", DescribeException(ctx->error_desc),
++                 ctx->error_desc);
++    std::fprintf(f, "base eden.nro = 0x%016lX\n", base);
++    std::fprintf(f, "PC  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->pc.x, off(ctx->pc.x));
++    std::fprintf(f, "LR  = 0x%016lX  (eden.nro+0x%lX)\n", ctx->lr.x, off(ctx->lr.x));
++    std::fprintf(f, "SP  = 0x%016lX  FP = 0x%016lX\n", ctx->sp.x, ctx->fp.x);
++    std::fprintf(f, "FAR = 0x%016lX  ESR = 0x%08X  PSTATE = 0x%08X\n", ctx->far.x, ctx->esr,
++                 ctx->pstate);
++    for (int i = 0; i < 29; ++i) {
++        std::fprintf(f, "X%-2d = 0x%016lX%s", i, ctx->cpu_gprs[i].x, (i % 2) ? "\n" : "   ");
++    }
++    DumpBacktrace(f, ctx->fp.x);
++    std::fclose(f);
++}
++
++// ---------------------------------------------------------------- salidas "silenciosas"
++// abort(), assert() de newlib, diagAbortWithResult, fatalThrow y svcBreak terminan el
++// proceso sin pasar por el handler de excepciones ni por std::terminate (por ejemplo,
++// un assert dentro del driver Vulkan o un fallo del JIT de kaiHEN). Con -Wl,--wrap
++// (ver CMakeLists.txt) pasan antes por aquí y dejan rastro en crash.txt.
++namespace {
++void NoteSilentExit(const char* what, const char* detail) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (!f) {
++        return;
++    }
++    std::fprintf(f, "=== %s ===\n%s\n", what, detail ? detail : "");
++    std::fprintf(f, "llamado desde eden.nro+0x%lX\n",
++                 NroOffset(reinterpret_cast<u64>(__builtin_return_address(0))));
++    DumpBacktrace(f, reinterpret_cast<u64>(__builtin_frame_address(0)));
++    std::fclose(f);
++}
++} // namespace
++
++extern "C" {
++// Para código fuera del frontend (Dynarmic): mismas migas de pan, sin headers de libnx.
++void eden_ounce_breadcrumb(const char* text) {
++    Ounce::Hos::Breadcrumb(text);
++}
++
++// libounce no implementa pthread_detach (en newlib.c está comentado como "Unsupported"),
++// así que std::thread::detach() fallaba y lanzaba std::system_error. Eden separa así
++// los hilos de los servicios HLE, que viven hasta que se cierra el emulador.
++// Un hilo separado no se une nunca: basta con no tocarlo (su estructura queda reservada,
++// unos pocos bytes por servicio).
++int __wrap_pthread_detach(pthread_t thread) {
++    (void)thread;
++    return 0;
++}
++
++[[noreturn]] void __real_abort(void);
++void __real___assert_func(const char* file, int line, const char* func, const char* expr);
++[[noreturn]] void __real_diagAbortWithResult(Result res);
++[[noreturn]] void __real_fatalThrow(Result err);
++Result __real_svcBreak(u32 reason, uintptr_t address, uintptr_t size);
++
++[[noreturn]] void __wrap_abort(void) {
++    NoteSilentExit("abort()", nullptr);
++    __real_abort();
++}
++
++void __wrap___assert_func(const char* file, int line, const char* func, const char* expr) {
++    char detail[512];
++    std::snprintf(detail, sizeof(detail), "assert(%s) en %s:%d (%s)", expr ? expr : "?",
++                  file ? file : "?", line, func ? func : "?");
++    NoteSilentExit("assert fallido", detail);
++    __real___assert_func(file, line, func, expr);
++}
++
++[[noreturn]] void __wrap_diagAbortWithResult(Result res) {
++    char detail[96];
++    std::snprintf(detail, sizeof(detail), "Result 0x%X (módulo %u, descripción %u)", res,
++                  R_MODULE(res), R_DESCRIPTION(res));
++    NoteSilentExit("diagAbortWithResult", detail);
++    __real_diagAbortWithResult(res);
++}
++
++[[noreturn]] void __wrap_fatalThrow(Result err) {
++    char detail[96];
++    std::snprintf(detail, sizeof(detail), "Result 0x%X (módulo %u, descripción %u)", err,
++                  R_MODULE(err), R_DESCRIPTION(err));
++    NoteSilentExit("fatalThrow", detail);
++    __real_fatalThrow(err);
++}
++
++Result __wrap_svcBreak(u32 reason, uintptr_t address, uintptr_t size) {
++    char detail[96];
++    std::snprintf(detail, sizeof(detail), "reason=0x%X address=0x%lX size=0x%lX", reason,
++                  static_cast<unsigned long>(address), static_cast<unsigned long>(size));
++    NoteSilentExit("svcBreak", detail);
++    return __real_svcBreak(reason, address, size);
++}
++} // extern "C"
 +
 +namespace Ounce::Hos {
 +
@@ -994,6 +2254,50 @@ index 0000000..5d9c469
 +static_assert(Button::Left == HidNpadButton_Left && Button::Up == HidNpadButton_Up);
 +static_assert(Button::Right == HidNpadButton_Right && Button::Down == HidNpadButton_Down);
 +static_assert(Button::AnySL == HidNpadButton_AnySL && Button::AnySR == HidNpadButton_AnySR);
++
++void InstallCrashHandler() {
++    // El handler ya está enlazado (símbolo fuerte); aquí solo dejamos una marca de sesión.
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "--- sesión iniciada (t=%ld) ---\n", static_cast<long>(std::time(nullptr)));
++        std::fclose(f);
++    }
++    // Prueba del handler: si existe este archivo, se borra y se provoca un fallo a propósito.
++    // Sirve para comprobar que, bajo KaiHEN, los fallos de CPU llegan a crash.txt.
++    constexpr const char* kTestCrash = "sdmc:/switch/eden/test_crash.txt";
++    if (FILE* t = std::fopen(kTestCrash, "r")) {
++        std::fclose(t);
++        std::remove(kTestCrash);
++        Breadcrumb("prueba de fallo: escribiendo en la dirección 0");
++        *static_cast<volatile int*>(nullptr) = 0x1234;
++    }
++}
++
++void Breadcrumb(const char* text) {
++    // libnx reserva casi toda la memoria como heap al arrancar (svcGetInfo siempre dice "lleno")
++    // y mallinfo de newlib no lo ve. Lo útil es hasta dónde llegó malloc dentro del heap:
++    // el "break" (sbrk(0)) menos el inicio de la región de heap. Nunca baja: es el máximo.
++    u64 heap_base = 0;
++    u64 total = 0;
++    svcGetInfo(&heap_base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
++    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    const u64 brk = reinterpret_cast<u64>(sbrk(0));
++    const u64 used = brk > heap_base ? brk - heap_base : 0;
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "[%10.3f] (heap máx %lu/%lu MiB) %s\n",
++                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
++        std::fclose(f);
++    }
++}
++
++void WriteCrashNote(const char* text) {
++    FILE* f = std::fopen(kCrashPath, "a");
++    if (f) {
++        std::fprintf(f, "%s\n", text);
++        std::fclose(f);
++    }
++}
 +
 +void SetNoSuspend() {
 +    appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
@@ -1009,6 +2313,14 @@ index 0000000..5d9c469
 +
 +bool IsInFocus() {
 +    return appletGetFocusState() == AppletFocusState_InFocus;
++}
++
++bool InitNetwork() {
++    return R_SUCCEEDED(socketInitializeDefault());
++}
++
++void ExitNetwork() {
++    socketExit();
 +}
 +
 +void SleepNs(std::int64_t ns) {
@@ -1073,10 +2385,10 @@ index 0000000..5d9c469
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
 new file mode 100644
-index 0000000..29c37f5
+index 0000000..9802a4d
 --- /dev/null
 +++ b/src/eden_ounce/horizon.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,85 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1104,7 +2416,22 @@ index 0000000..29c37f5
 +bool IsDocked();         ///< true en modo TV/dock.
 +bool IsInFocus();
 +void SleepNs(std::int64_t ns);
++/// Inicializa los sockets BSD de libounce (los usa la red emulada y su socket de
++/// interrupción). Devuelve false si no hay servicio de red; el emulador sigue igual.
++bool InitNetwork();
++void ExitNetwork();
 +std::uint64_t MonotonicNs();
++
++// ------------------------------------------------------------------ fallos
++/// Archivo donde se escriben los fallos (sdmc:/switch/eden/log/crash.txt).
++/// Un fallo de CPU (acceso inválido, instrucción ilegal...) se escribe solo, con
++/// PC/LR/FAR como desplazamiento dentro de eden.nro, para ubicarlo con addr2line.
++void InstallCrashHandler();
++/// Añade una línea de texto a crash.txt (excepciones de C++, std::terminate...).
++void WriteCrashNote(const char* text);
++/// Migas de pan: una línea con marca de tiempo en crash.txt, escrita al instante (sin el
++/// hilo del log de Eden), para saber hasta dónde llegó el arranque si el proceso muere.
++void Breadcrumb(const char* text);
 +
 +// ------------------------------------------------------------------ vídeo
 +void* DefaultWindow();   ///< NWindow* por defecto (para VK_NN_vi_surface).
@@ -1140,13 +2467,19 @@ index 0000000..29c37f5
 +/// Muestra un error a pantalla completa hasta que se pulse +.
 +void ShowFatal(const std::string& message);
 +
++/// Pinta la pantalla "Cargando NX" en un búfer de píxeles u32 (la presenta Vulkan).
++/// progress: 0..1, o negativo para una barra animada sin porcentaje. tick anima la barra.
++void PaintLoadingScreen(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height,
++                        bool bgra, const std::string& title, const std::string& status,
++                        float progress, std::uint64_t tick);
++
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/launcher.cpp b/src/eden_ounce/launcher.cpp
 new file mode 100644
-index 0000000..f883d4e
+index 0000000..83cfd1f
 --- /dev/null
 +++ b/src/eden_ounce/launcher.cpp
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,249 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1263,12 +2596,145 @@ index 0000000..f883d4e
 +}
 +
 +} // namespace Ounce::Hos
++
++// ------------------------------------------------------------------ pantalla de carga
++namespace Ounce::Hos {
++namespace {
++
++// UTF-8 -> página de códigos 437 (la fuente de la consola de libnx), para las tildes.
++std::string ToCp437(const std::string& in) {
++    std::string out;
++    for (size_t i = 0; i < in.size(); ++i) {
++        const unsigned char c = static_cast<unsigned char>(in[i]);
++        if (c < 0x80) {
++            out += static_cast<char>(c);
++            continue;
++        }
++        if ((c & 0xE0) == 0xC0 && i + 1 < in.size()) {
++            const unsigned cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(in[++i]) & 0x3F);
++            switch (cp) {
++            case 0xE1: out += '\xA0'; break; // á
++            case 0xE9: out += '\x82'; break; // é
++            case 0xED: out += '\xA1'; break; // í
++            case 0xF3: out += '\xA2'; break; // ó
++            case 0xFA: out += '\xA3'; break; // ú
++            case 0xF1: out += '\xA4'; break; // ñ
++            case 0xD1: out += '\xA5'; break; // Ñ
++            case 0xFC: out += '\x81'; break; // ü
++            case 0xC9: out += '\x90'; break; // É
++            case 0xBF: out += '\xA8'; break; // ¿
++            case 0xA1: out += '\xAD'; break; // ¡
++            default: out += '?'; break;
++            }
++            continue;
++        }
++        // Secuencias de 3-4 bytes (™, ®...): se saltan.
++        while (i + 1 < in.size() && (static_cast<unsigned char>(in[i + 1]) & 0xC0) == 0x80) {
++            ++i;
++        }
++    }
++    return out;
++}
++
++struct Canvas {
++    std::uint32_t* px;
++    std::uint32_t w, h;
++    bool bgra;
++
++    std::uint32_t Color(std::uint32_t rgb) const {
++        const std::uint32_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
++        return bgra ? (0xFF000000u | (r << 16) | (g << 8) | b) : (0xFF000000u | (b << 16) | (g << 8) | r);
++    }
++    void Rect(int x, int y, int rw, int rh, std::uint32_t rgb) const {
++        const std::uint32_t c = Color(rgb);
++        for (int j = std::max(0, y); j < std::min<int>(h, y + rh); ++j) {
++            for (int i = std::max(0, x); i < std::min<int>(w, x + rw); ++i) {
++                px[size_t(j) * w + i] = c;
++            }
++        }
++    }
++    // Glifos de 16x16 de la fuente de libnx: fila r = palabra r, bit 15-i = columna i.
++    void Text(int x, int y, const std::string& utf8, int scale, std::uint32_t rgb) const {
++        const auto* font = static_cast<const std::uint16_t*>(consoleGetDefault()->font.gfx);
++        const std::uint32_t c = Color(rgb);
++        const std::string text = ToCp437(utf8);
++        for (size_t n = 0; n < text.size(); ++n) {
++            const std::uint16_t* glyph = font + 16 * static_cast<unsigned char>(text[n]);
++            const int gx = x + int(n) * 16 * scale;
++            for (int r = 0; r < 16; ++r) {
++                for (int i = 0; i < 16; ++i) {
++                    if (!(glyph[r] & (0x8000 >> i))) {
++                        continue;
++                    }
++                    for (int sy = 0; sy < scale; ++sy) {
++                        const int py = y + r * scale + sy;
++                        if (py < 0 || py >= int(h)) continue;
++                        for (int sx = 0; sx < scale; ++sx) {
++                            const int pxx = gx + i * scale + sx;
++                            if (pxx >= 0 && pxx < int(w)) px[size_t(py) * w + pxx] = c;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    static int TextWidth(const std::string& utf8, int scale) {
++        return int(ToCp437(utf8).size()) * 16 * scale;
++    }
++    void Centered(int y, const std::string& text, int scale, std::uint32_t rgb) const {
++        Text((int(w) - TextWidth(text, scale)) / 2, y, text, scale, rgb);
++    }
++};
++
++} // namespace
++
++void PaintLoadingScreen(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height,
++                        bool bgra, const std::string& title, const std::string& status,
++                        float progress, std::uint64_t tick) {
++    const Canvas cv{pixels, width, height, bgra};
++    const float k = float(height) / 720.0f; // tamaños pensados para 720p
++    const int big = std::max(1, int(4 * k + 0.5f));
++    const int mid = std::max(1, int(2 * k + 0.5f));
++
++    cv.Rect(0, 0, int(width), int(height), 0x0F1216);
++
++    const int title_y = int(height * 0.30f);
++    const std::string dots(1 + (tick / 8) % 3, '.');
++    const std::string head = "Cargando NX";
++    // Puntos animados fuera del centrado, para que el texto no baile.
++    const int head_x = (int(width) - Canvas::TextWidth(head, big)) / 2;
++    cv.Text(head_x, title_y, head + dots, big, 0xFFFFFF);
++
++    std::string game = title;
++    const size_t max_chars = size_t(width / (16 * mid)) - 4;
++    if (game.size() > max_chars) game = game.substr(0, max_chars - 3) + "...";
++    cv.Centered(title_y + 16 * big + int(24 * k), game, mid, 0x00C3E3);
++
++    const int bar_w = int(width * 0.6f);
++    const int bar_h = std::max(6, int(14 * k));
++    const int bar_x = (int(width) - bar_w) / 2;
++    const int bar_y = int(height * 0.62f);
++    cv.Rect(bar_x, bar_y, bar_w, bar_h, 0x2A3038);
++    if (progress >= 0.0f) {
++        const float p = std::min(progress, 1.0f);
++        cv.Rect(bar_x, bar_y, int(bar_w * p), bar_h, 0x00C3E3);
++    } else {
++        const int seg = bar_w / 4;
++        const int pos = int((tick * 12) % size_t(bar_w + seg)) - seg;
++        cv.Rect(std::max(bar_x, bar_x + pos), bar_y,
++                std::min(seg, bar_w - std::max(0, pos)) + std::min(0, pos), bar_h, 0x00C3E3);
++    }
++    cv.Centered(bar_y + bar_h + int(20 * k), status, mid, 0xB8C0CC);
++    cv.Centered(int(height) - int(48 * k), "Eden para Switch 2", std::max(1, mid - 1), 0x5A6470);
++}
++
++} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..f425361
+index 0000000..a4e530b
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,325 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1285,11 +2751,16 @@ index 0000000..f425361
 +//   sdmc:/switch/eden/nand/system/... (firmware dumpeado, opcional pero recomendado)
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cctype>
++#include <cstdlib>
++#include <exception>
 +#include <cstdio>
 +#include <filesystem>
++#include <format>
 +#include <string>
 +#include <system_error>
++#include <thread>
 +#include <vector>
 +
 +#include "common/fs/fs.h"
@@ -1298,11 +2769,13 @@ index 0000000..f425361
 +#include "common/settings.h"
 +#include "core/core.h"
 +#include "core/cpu_manager.h"
++#include "core/perf_stats.h"
 +#include "core/file_sys/registered_cache.h"
 +#include "core/file_sys/vfs/vfs_real.h"
 +#include "core/hle/service/am/applet_manager.h"
 +#include "core/hle/service/filesystem/filesystem.h"
 +#include "core/loader/loader.h"
++#include "video_core/renderer_base.h"
 +#include "eden_ounce/emu_window_ounce.h"
 +#include "eden_ounce/horizon.h"
 +#include "input_common/main.h"
@@ -1326,6 +2799,14 @@ index 0000000..f425361
 +    values.cpuopt_fastmem.SetValue(false);
 +    values.cpuopt_fastmem_exclusives.SetValue(false);
 +    values.use_multi_core.SetValue(true);
++    // Sin fastmem cada acceso a memoria ya es caro: no sumar comprobaciones de precisión.
++    // Son las mismas optimizaciones "inseguras" que usa Eden en Android.
++    values.cpu_accuracy.SetValue(CpuAccuracy::Unsafe);
++    values.cpuopt_unsafe_unfuse_fma.SetValue(true);
++    values.cpuopt_unsafe_reduce_fp_error.SetValue(true);
++    values.cpuopt_unsafe_ignore_standard_fpcr.SetValue(true);
++    values.cpuopt_unsafe_inaccurate_nan.SetValue(true);
++    values.cpuopt_unsafe_ignore_global_monitor.SetValue(true);
 +    // 4 GiB como la Switch 1; el pool de un juego de Switch 2 no da para más con Eden encima.
 +    values.memory_layout_mode.SetValue(MemoryLayout::Memory_4Gb);
 +
@@ -1334,6 +2815,15 @@ index 0000000..f425361
 +    values.resolution_setup.SetValue(ResolutionSetup::Res1X);
 +    values.use_disk_shader_cache.SetValue(true);
 +    values.use_asynchronous_gpu_emulation.SetValue(true);
++    // Eden solo pone los valores rápidos de GPU si compila para Android; aquí hay que pedirlos.
++    values.gpu_accuracy.SetValue(GpuAccuracy::Low);
++    values.use_reactive_flushing.SetValue(false);
++    values.async_presentation.SetValue(true);
++    values.max_anisotropy.SetValue(AnisotropyMode::Default);
++    values.use_vulkan_driver_pipeline_cache.SetValue(true);
++    // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
++    // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
++    values.use_asynchronous_shaders.SetValue(true);
 +    // NVDEC por CPU necesita FFmpeg; desactivado hasta portarlo (los vídeos salen en negro).
 +    values.nvdec_emulation.SetValue(NvdecEmulation::Off);
 +    // Fase 1: sin backend de audio nativo todavía.
@@ -1356,13 +2846,64 @@ index 0000000..f425361
 +
 +} // namespace
 +
++extern "C" void eden_ounce_jit_stats(u64* count, u64* bytes, u64* ns) __attribute__((weak));
++
++namespace {
++
++/// Cualquier excepción de C++ sin atrapar (en cualquier hilo) termina aquí: dejar
++/// constancia en el log y en crash.txt antes de abortar, para no volver al hbmenu a ciegas.
++[[noreturn]] void OnTerminate() {
++    std::string reason = "std::terminate sin excepción activa";
++    if (const auto ex = std::current_exception()) {
++        try {
++            std::rethrow_exception(ex);
++        } catch (const std::exception& e) {
++            reason = std::string{"Excepción sin atrapar: "} + e.what();
++        } catch (...) {
++            reason = "Excepción sin atrapar (tipo desconocido)";
++        }
++    }
++    // Primero crash.txt (escritura directa): vaciar el log puede bloquearse.
++    Ounce::Hos::WriteCrashNote(reason.c_str());
++    LOG_CRITICAL(Frontend, "{}", reason);
++    Common::Log::Stop(); // vacía el log a la SD
++    std::abort();
++}
++
++int RunEmulator(int argc, char** argv);
++
++} // namespace
++
 +int main(int argc, char** argv) {
++    // El log ya no se escribe línea a línea (frenaba la emulación con escrituras a la SD);
++    // las migas de pan de crash.txt siguen siendo inmediatas.
++    Settings::values.log_flush_line.SetValue(false);
++    Ounce::Hos::InstallCrashHandler();
++    std::set_terminate(OnTerminate);
++    try {
++        return RunEmulator(argc, argv);
++    } catch (const std::exception& e) {
++        const std::string reason = std::string{"Excepción: "} + e.what();
++        Ounce::Hos::WriteCrashNote(reason.c_str());
++        LOG_CRITICAL(Frontend, "{}", reason);
++        Common::Log::Stop();
++        Ounce::Hos::ShowFatal(reason + "\nRevisa sdmc:/switch/eden/log/");
++        return 1;
++    }
++}
++
++namespace {
++
++int RunEmulator(int argc, char** argv) {
 +    // Que el juego emulado no se pause si el usuario abre el menu HOME un instante.
 +    Ounce::Hos::SetNoSuspend();
 +
 +    Common::Log::Initialize();
 +    Common::Log::Start();
 +    LOG_INFO(Frontend, "eden-ounce arrancando");
++    if (!Ounce::Hos::InitNetwork()) {
++        LOG_WARNING(Frontend, "Sin sockets: la red emulada no funcionara");
++    }
 +
 +    std::string error;
 +    if (!CheckKeys(error)) {
@@ -1378,6 +2919,7 @@ index 0000000..f425361
 +        }
 +    }
 +    LOG_INFO(Frontend, "Juego: {}", filepath);
++    Ounce::Hos::Breadcrumb("juego elegido");
 +
 +    ConfigureForSwitch2();
 +
@@ -1386,6 +2928,7 @@ index 0000000..f425361
 +
 +    system.Initialize();
 +    system.ApplySettings();
++    Ounce::Hos::Breadcrumb("Core::System inicializado");
 +
 +    auto window = std::make_unique<EdenOunce::EmuWindowOunce>(input_subsystem, system);
 +
@@ -1397,7 +2940,9 @@ index 0000000..f425361
 +    Service::AM::FrontendAppletParameters load_parameters{
 +        .applet_id = Service::AM::AppletId::Application,
 +    };
++    Ounce::Hos::Breadcrumb("cargando juego (incluye crear el renderer Vulkan)");
 +    const Core::SystemResultStatus load_result = system.Load(*window, filepath, load_parameters);
++    Ounce::Hos::Breadcrumb("system.Load terminado");
 +    if (load_result != Core::SystemResultStatus::Success) {
 +        const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
 +        std::string description = "Error de carga";
@@ -1411,33 +2956,107 @@ index 0000000..f425361
 +        return 1;
 +    }
 +
++    // Pantalla "Cargando NX": la pinta el propio renderer Vulkan hasta que el juego presente
++    // su primer fotograma (la última imagen se queda en pantalla, sin negro de por medio).
++    std::string title;
++    if (system.GetAppLoader().ReadTitle(title) != Loader::ResultStatus::Success || title.empty()) {
++        title = std::filesystem::path(filepath).stem().string();
++    }
++    u64 tick = 0;
++    const auto draw_loading = [&](const std::string& status, float progress) {
++        system.Renderer().DrawHostImage([&](std::span<u32> px, u32 w, u32 h, bool bgra) {
++            Ounce::Hos::PaintLoadingScreen(px.data(), w, h, bgra, title, status, progress, tick);
++        });
++        ++tick;
++    };
++    draw_loading("Preparando la GPU", -1.0f);
++
 +    system.GPU().Start();
++    Ounce::Hos::Breadcrumb("GPU iniciada");
 +    system.GetCpuManager().OnGpuReady();
++    Ounce::Hos::Breadcrumb("CpuManager listo");
 +
 +    if (Settings::values.use_disk_shader_cache.GetValue()) {
-+        system.Renderer().ReadRasterizer()->LoadDiskResources(
-+            system.GetApplicationProcessProgramID(), std::stop_token{},
-+            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
++        // Los shaders guardados se compilan en otro hilo; este dibuja el progreso.
++        std::atomic<int> stage{static_cast<int>(VideoCore::LoadCallbackStage::Prepare)};
++        std::atomic<size_t> built{0}, total{0};
++        std::atomic<bool> done{false};
++        std::stop_source stop;
++        std::thread loader{[&] {
++            system.Renderer().ReadRasterizer()->LoadDiskResources(
++                system.GetApplicationProcessProgramID(), stop.get_token(),
++                [&](VideoCore::LoadCallbackStage s, size_t value, size_t count) {
++                    stage = static_cast<int>(s);
++                    built = value;
++                    total = count;
++                });
++            done = true;
++        }};
++        while (!done) {
++            const auto s = static_cast<VideoCore::LoadCallbackStage>(stage.load());
++            const size_t n = built, t = total;
++            if (s == VideoCore::LoadCallbackStage::Build && t > 0) {
++                draw_loading(std::format("Cargando shaders {} / {}", n, t), float(n) / float(t));
++            } else {
++                draw_loading("Leyendo la caché de shaders", -1.0f);
++            }
++            if (!window->PumpEvents()) {
++                stop.request_stop();
++            }
++            Ounce::Hos::SleepNs(33'000'000);
++        }
++        loader.join();
++        if (stop.stop_requested()) {
++            Ounce::Hos::Breadcrumb("salida pedida durante la carga de shaders");
++            system.ShutdownMainProcess();
++            window.reset();
++            Ounce::Hos::ExitNetwork();
++            return 0;
++        }
 +    }
++    draw_loading("Iniciando el juego", 1.0f);
 +
-+    system.RegisterExitCallback([&window] { window->RequestClose(); });
++    Ounce::Hos::Breadcrumb("caché de shaders leída");
++    system.RegisterExitCallback([&window] {
++        Ounce::Hos::Breadcrumb("el juego pidió salir");
++        window->RequestClose();
++    });
 +
 +    void(system.Run());
++    Ounce::Hos::Breadcrumb("emulación en marcha (system.Run)");
 +
 +    // El emulador corre en sus propios hilos (núcleos de CPU, GPU, servicios);
 +    // este hilo solo bombea entrada y eventos del applet.
++    u64 loops = 0;
 +    while (window->PumpEvents()) {
 +        Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
++        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo + rendimiento
++            const auto perf = system.GetAndResetPerfStats();
++            u64 jit_count = 0, jit_bytes = 0, jit_ns = 0;
++            if (eden_ounce_jit_stats) {
++                eden_ounce_jit_stats(&jit_count, &jit_bytes, &jit_ns);
++            }
++            const std::string beat = std::format(
++                "latido {} s | velocidad {:.0f}% | juego {:.1f} FPS | JIT: {} publicaciones, "
++                "{} KiB, {:.1f} s en IPC",
++                loops / 250, perf.emulation_speed * 100.0, perf.average_game_fps, jit_count,
++                jit_bytes >> 10, static_cast<double>(jit_ns) / 1e9);
++            Ounce::Hos::Breadcrumb(beat.c_str());
++        }
 +    }
++    Ounce::Hos::Breadcrumb("saliendo del bucle principal");
 +
 +    if (system.IsPoweredOn()) {
 +        system.Pause();
 +        system.ShutdownMainProcess();
 +    }
 +    window.reset();
++    Ounce::Hos::ExitNetwork();
 +    LOG_INFO(Frontend, "eden-ounce cerrado");
 +    return 0;
 +}
++
++} // namespace
 +
 +#define VMA_IMPLEMENTATION
 +#include "video_core/vulkan_common/vma.h"
@@ -1573,10 +3192,31 @@ index 0000000..3bf3324
 +
 +} // namespace EdenOunce
 diff --git a/src/input_common/CMakeLists.txt b/src/input_common/CMakeLists.txt
-index 840602f..fadedf4 100644
+index 840602f..eb0b824 100644
 --- a/src/input_common/CMakeLists.txt
 +++ b/src/input_common/CMakeLists.txt
-@@ -53,6 +53,8 @@ if (ANDROID)
+@@ -15,7 +15,6 @@ add_library(input_common STATIC
+     drivers/tas_input.h
+     drivers/touch_screen.cpp
+     drivers/touch_screen.h
+-    drivers/udp_client.cpp
+     drivers/udp_client.h
+     drivers/virtual_amiibo.cpp
+     drivers/virtual_amiibo.h
+@@ -47,12 +46,21 @@ else()
+     target_compile_options(input_common PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-Wconversion>)
+ endif()
+ 
++if (NINTENDO_SWITCH2)
++    # Sin Boost.Asio sobre sockets POSIX: cliente UDP vacío.
++    target_sources(input_common PRIVATE drivers/udp_client_horizon.cpp)
++else()
++    target_sources(input_common PRIVATE drivers/udp_client.cpp)
++endif()
++
+ if (ANDROID)
+     target_sources(input_common PRIVATE
+         drivers/android.cpp
          drivers/android.h)
  
      target_link_libraries(input_common PRIVATE android)
@@ -1585,6 +3225,381 @@ index 840602f..fadedf4 100644
  else()
      target_sources(input_common PRIVATE
          drivers/joycon.cpp
+diff --git a/src/input_common/drivers/udp_client_horizon.cpp b/src/input_common/drivers/udp_client_horizon.cpp
+new file mode 100644
+index 0000000..03021e0
+--- /dev/null
++++ b/src/input_common/drivers/udp_client_horizon.cpp
+@@ -0,0 +1,58 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// Switch 2: cliente cemuhook (UDP) vacío. El real usa Boost.Asio sobre sockets POSIX
++// (sys/uio.h, readv/writev...) que libounce no ofrece; en la consola los mandos son nativos.
++
++#include "input_common/drivers/udp_client.h"
++
++namespace InputCommon::CemuhookUDP {
++
++class Socket {};
++
++UDPClient::UDPClient(std::string input_engine_) : InputEngine(std::move(input_engine_)) {}
++
++UDPClient::~UDPClient() = default;
++
++UDPClient::ClientConnection::ClientConnection() = default;
++UDPClient::ClientConnection::~ClientConnection() = default;
++
++void UDPClient::ReloadSockets() {}
++
++std::vector<Common::ParamPackage> UDPClient::GetInputDevices() const {
++    return {};
++}
++
++ButtonMapping UDPClient::GetButtonMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++AnalogMapping UDPClient::GetAnalogMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++MotionMapping UDPClient::GetMotionMappingForDevice(const Common::ParamPackage&) {
++    return {};
++}
++
++Common::Input::ButtonNames UDPClient::GetUIName(const Common::ParamPackage&) const {
++    return Common::Input::ButtonNames::Invalid;
++}
++
++bool UDPClient::IsStickInverted(const Common::ParamPackage&) {
++    return false;
++}
++
++void TestCommunication(const std::string&, u16, const std::function<void()>&,
++                       const std::function<void()>& failure_callback) {
++    failure_callback();
++}
++
++CalibrationConfigurationJob::CalibrationConfigurationJob(
++    const std::string&, u16, std::function<void(Status)>, std::function<void(u16, u16, u16, u16)>) {}
++
++CalibrationConfigurationJob::~CalibrationConfigurationJob() = default;
++
++void CalibrationConfigurationJob::Stop() {}
++
++} // namespace InputCommon::CemuhookUDP
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index 64d14ab..ba0dc23 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -418,6 +418,12 @@ endif()
+ target_include_directories(video_core PUBLIC ${FFmpeg_INCLUDE_DIR})
+ 
+ target_link_libraries(video_core PRIVATE ${FFmpeg_LIBRARIES})
++if (NINTENDO_SWITCH2)
++    # FFmpeg de los portlibs es estático: sus dependencias privadas (dav1d, zlib) van detrás.
++    # "-lz" como opción cruda: CMake no la funde con el libz.a que ya salió antes en la
++    # línea (antes de libavcodec), así que queda detrás y resuelve uncompress().
++    target_link_libraries(video_core PRIVATE dav1d -lz)
++endif()
+ target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
+ 
+ add_dependencies(video_core host_shaders)
+diff --git a/src/video_core/renderer_base.h b/src/video_core/renderer_base.h
+index ea45ab2..7df0f13 100644
+--- a/src/video_core/renderer_base.h
++++ b/src/video_core/renderer_base.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <functional>
+ #include <memory>
++#include <span>
+ 
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+@@ -48,6 +49,12 @@ public:
+ 
+     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
+ 
++    /// Pinta una imagen del frontend (p. ej. una pantalla de carga) y la presenta, mientras el
++    /// juego todavía no dibuja nada. `bgra` dice el orden de bytes de cada píxel u32.
++    /// Solo debe llamarse cuando el juego no está presentando (antes de System::Run).
++    using HostImagePainter = std::function<void(std::span<u32> pixels, u32 width, u32 height, bool bgra)>;
++    virtual void DrawHostImage(const HostImagePainter& paint) {}
++
+     // Getter/setter functions:
+     // ------------------------
+ 
+diff --git a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp b/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+index 6c18ade..f301ee7 100644
+--- a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
++++ b/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
+@@ -263,6 +263,10 @@ FormatInfo SurfaceFormat(const Device& device, FormatType format_type, bool with
+             break;
+         }
+     }
++    if (pixel_format == PixelFormat::A5B5G5R1_UNORM && device.MustConvertA5B5G5R1()) {
++        // Sin formatos 5551 muestreables: se convierte a RGBA8 (ver ConvertImage).
++        tuple.format = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
++    }
+     if (!device.IsOptimalBcnSupported() && VideoCore::Surface::IsPixelFormatBCn(pixel_format)) {
+         // Transcode on hardware that doesn't support BCn natively
+         if (pixel_format == PixelFormat::BC4_SNORM) {
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index e81e4b0..2f71128 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -212,6 +212,101 @@ RendererVulkan::~RendererVulkan() {
+     void(device.GetLogical().WaitIdle());
+ }
+ 
++void RendererVulkan::DrawHostImage(const HostImagePainter& paint) {
++    if (!render_window.IsShown()) {
++        return;
++    }
++    Frame* frame = present_manager.GetRenderFrame();
++    blit_swapchain.PrepareHostFrame(device, frame, render_window.GetFramebufferLayout());
++    const u32 width = frame->width;
++    const u32 height = frame->height;
++    if (width == 0 || height == 0 || !frame->image) {
++        return;
++    }
++    const size_t size = size_t{width} * height * sizeof(u32);
++    // Un solo búfer de subida: se espera a la GPU antes de volver a escribirlo.
++    scheduler.Finish();
++    if (!host_image_buffer || host_image_size != size) {
++        host_image_buffer = memory_allocator.CreateBuffer(
++            VkBufferCreateInfo{
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .flags = 0,
++                .size = size,
++                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                .queueFamilyIndexCount = 0,
++                .pQueueFamilyIndices = nullptr,
++            },
++            MemoryUsage::Upload);
++        host_image_size = size;
++    }
++    const VkFormat format = swapchain.GetImageFormat();
++    const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
++    auto mapped = host_image_buffer.Mapped();
++    paint(std::span<u32>(reinterpret_cast<u32*>(mapped.data()), size_t{width} * height), width,
++          height, bgra);
++    host_image_buffer.Flush();
++
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([buffer = *host_image_buffer, image = *frame->image, width,
++                      height](vk::CommandBuffer cmdbuf) {
++        const VkImageSubresourceRange range{
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++        };
++        const VkImageMemoryBarrier to_dst{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = 0,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = image,
++            .subresourceRange = range,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               0, to_dst);
++        const VkBufferImageCopy copy{
++            .bufferOffset = 0,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource =
++                {
++                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .mipLevel = 0,
++                    .baseArrayLayer = 0,
++                    .layerCount = 1,
++                },
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {width, height, 1},
++        };
++        cmdbuf.CopyBufferToImage(buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
++        // PresentManager espera la imagen del frame en GENERAL.
++        const VkImageMemoryBarrier to_general{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = image,
++            .subresourceRange = range,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               0, to_general);
++    });
++    scheduler.Flush(*frame->render_ready);
++    present_manager.Present(frame);
++}
++
+ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+     SCOPE_EXIT {
+         render_window.OnFrameDisplayed();
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.h b/src/video_core/renderer_vulkan/renderer_vulkan.h
+index 87422dd..3df1325 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -51,6 +51,8 @@ public:
+ 
+     std::vector<u8> GetAppletCaptureBuffer() override;
+ 
++    void DrawHostImage(const HostImagePainter& paint) override;
++
+     VideoCore::RasterizerInterface* ReadRasterizer() override {
+         return &rasterizer;
+     }
+@@ -107,6 +109,9 @@ private:
+     std::optional<TurboMode> turbo_mode;
+ 
+     Frame applet_frame;
++
++    vk::Buffer host_image_buffer;
++    size_t host_image_size{};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_blit_screen.cpp b/src/video_core/renderer_vulkan/vk_blit_screen.cpp
+index 4228440..310ebb8 100644
+--- a/src/video_core/renderer_vulkan/vk_blit_screen.cpp
++++ b/src/video_core/renderer_vulkan/vk_blit_screen.cpp
+@@ -102,6 +102,14 @@ void BlitScreen::PrepareFrame(const Device& device, Frame* frame,
+                                   window_adapt->GetRenderPass(), true);
+ }
+ 
++void BlitScreen::PrepareHostFrame(const Device& device, Frame* frame,
++                                  const Layout::FramebufferLayout& layout) {
++    if (!window_adapt) {
++        SetWindowAdaptPass(device);
++    }
++    PrepareFrame(device, frame, layout);
++}
++
+ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
+                              std::span<const Tegra::FramebufferConfig> framebuffers,
+                              const Layout::FramebufferLayout& layout,
+diff --git a/src/video_core/renderer_vulkan/vk_blit_screen.h b/src/video_core/renderer_vulkan/vk_blit_screen.h
+index 719e348..e240af0 100644
+--- a/src/video_core/renderer_vulkan/vk_blit_screen.h
++++ b/src/video_core/renderer_vulkan/vk_blit_screen.h
+@@ -62,6 +62,9 @@ public:
+ 
+     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
+ 
++    /// Como PrepareFrame, pero sirve antes del primer DrawToFrame (crea el pase de ventana).
++    void PrepareHostFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
++
+     /// Draws the overlay panels on top (the screen's pass only: never in a screenshot or the
+     /// applets' capture)
+     void DrawOverlayPanels(bool draw) {
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index ab82c3f..0eae4b1 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -741,7 +741,8 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
+ }
+ 
+ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4>& swizzle,
+-                                 bool emulate_bgr565, bool emulate_a4b4g4r4) {
++                                 bool emulate_bgr565, bool emulate_a4b4g4r4,
++                                 bool emulate_r5g5b5a1, bool convert_a5b5g5r1) {
+     switch (format) {
+     case PixelFormat::A1B5G5R5_UNORM:
+         std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
+@@ -752,7 +753,15 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
+         }
+         break;
+     case PixelFormat::A5B5G5R1_UNORM:
++        if (convert_a5b5g5r1) {
++            // Ya convertida a RGBA8 con los canales en su sitio: sin swizzle especial.
++            break;
++        }
+         std::ranges::transform(swizzle, swizzle.begin(), SwapSpecial);
++        if (emulate_r5g5b5a1) {
++            // La imagen real es B5G5R5A1: lo que R5G5B5A1 llamaba R ahora se lee como B.
++            std::ranges::transform(swizzle, swizzle.begin(), SwapBlueRed);
++        }
+         break;
+     case PixelFormat::G4R4_UNORM:
+         std::ranges::transform(swizzle, swizzle.begin(), SwapGreenRed);
+@@ -1953,6 +1962,9 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+         flags |= VideoCommon::ImageFlagBits::Converted;
+         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
+     }
++    if (info.format == PixelFormat::A5B5G5R1_UNORM && runtime->device.MustConvertA5B5G5R1()) {
++        flags |= VideoCommon::ImageFlagBits::Converted;
++    }
+     if (runtime->device.HasDebuggingToolAttached()) {
+         original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
+     }
+@@ -2587,7 +2599,9 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
+         swizzle = info.Swizzle();
+         TryTransformSwizzleIfNeeded(format, swizzle,
+                         device->MustEmulateBGR565(),
+-                        !device->IsExt4444FormatsSupported());
++                        !device->IsExt4444FormatsSupported(),
++                        device->MustEmulateR5G5B5A1(),
++                        device->MustConvertA5B5G5R1());
+         if ((aspect_mask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
+             std::ranges::transform(swizzle, swizzle.begin(), ConvertGreenRed);
+             SanitizeDepthStencilSwizzle(swizzle, device->SupportsDepthStencilSwizzleOne());
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index e55d075..a9412d1 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -922,6 +922,22 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
+     return copies;
+ }
+ 
++namespace {
++
++/// A5B5G5R1 del invitado (16 bits: A[15:11] B[10:6] G[5:1] R[0]) -> A8B8G8R8 (bytes R,G,B,A).
++void ConvertA5B5G5R1ToA8B8G8R8(std::span<const u8> input, std::span<u8> output, u32 texels) {
++    const auto expand5 = [](u32 v) { return static_cast<u8>((v << 3) | (v >> 2)); };
++    for (u32 i = 0; i < texels; ++i) {
++        const u32 p = static_cast<u32>(input[i * 2]) | (static_cast<u32>(input[i * 2 + 1]) << 8);
++        output[i * 4 + 0] = (p & 1) ? 0xFF : 0x00;
++        output[i * 4 + 1] = expand5((p >> 1) & 0x1F);
++        output[i * 4 + 2] = expand5((p >> 6) & 0x1F);
++        output[i * 4 + 3] = expand5((p >> 11) & 0x1F);
++    }
++}
++
++} // Anonymous namespace
++
+ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
+                   std::span<BufferImageCopy> copies) {
+     u32 output_offset = 0;
+@@ -943,7 +959,12 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
+         const auto recompression_setting = Settings::values.astc_recompression.GetValue();
+         const bool astc = IsPixelFormatASTC(info.format);
+ 
+-        if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
++        if (info.format == PixelFormat::A5B5G5R1_UNORM) {
++            const u32 texels = copy.image_extent.width * copy.image_extent.height *
++                               copy.image_extent.depth * copy.image_subresource.num_layers;
++            ConvertA5B5G5R1ToA8B8G8R8(input_offset, output.subspan(output_offset), texels);
++            output_offset += texels * 4;
++        } else if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
+             Tegra::Texture::ASTC::Decompress(
+                 input_offset, copy.image_extent.width, copy.image_extent.height,
+                 copy.image_subresource.num_layers * copy.image_extent.depth, tile_size.width,
 diff --git a/src/video_core/vulkan_common/vulkan.h b/src/video_core/vulkan_common/vulkan.h
 index 2609e8d..feb5be6 100644
 --- a/src/video_core/vulkan_common/vulkan.h
@@ -1598,6 +3613,90 @@ index 2609e8d..feb5be6 100644
  #else
  #define VK_USE_PLATFORM_XLIB_KHR
  #define VK_USE_PLATFORM_WAYLAND_KHR
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 4897232..552adfa 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -65,6 +65,13 @@ constexpr std::array DEPTH16_UNORM_STENCIL8_UINT{
+     VK_FORMAT_UNDEFINED,
+ };
+ 
++// Mismo layout de bits que R5G5B5A1 con R y B intercambiados: la vista lo corrige con
++// el swizzle (ver MustEmulateR5G5B5A1). Hace falta, por ejemplo, en OunceVK (Switch 2).
++constexpr std::array R5G5B5A1_UNORM_PACK16{
++    VK_FORMAT_B5G5R5A1_UNORM_PACK16,
++    VK_FORMAT_UNDEFINED,
++};
++
+ constexpr std::array B5G6R5_UNORM_PACK16{
+     VK_FORMAT_R5G6B5_UNORM_PACK16,
+     VK_FORMAT_UNDEFINED,
+@@ -126,6 +133,8 @@ constexpr const VkFormat* GetFormatAlternatives(VkFormat format) {
+         return Alternatives::DEPTH16_UNORM_STENCIL8_UINT.data();
+     case VK_FORMAT_B5G6R5_UNORM_PACK16:
+         return Alternatives::B5G6R5_UNORM_PACK16.data();
++    case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
++        return Alternatives::R5G5B5A1_UNORM_PACK16.data();
+     case VK_FORMAT_R4G4_UNORM_PACK8:
+         return Alternatives::R4G4_UNORM_PACK8.data();
+     case VK_FORMAT_R16G16B16_SFLOAT:
+@@ -996,6 +1005,22 @@ bool Device::MustEmulateBGR565() const {
+     return Settings::values.emulate_bgr565.GetValue();
+ }
+ 
++bool Device::MustConvertA5B5G5R1() const {
++    constexpr VkFormatFeatureFlags usage = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++    return !IsFormatSupported(VK_FORMAT_R5G5B5A1_UNORM_PACK16, usage, FormatType::Optimal) &&
++           !IsFormatSupported(VK_FORMAT_B5G5R5A1_UNORM_PACK16, usage, FormatType::Optimal);
++}
++
++bool Device::MustEmulateR5G5B5A1() const {
++    constexpr VkFormatFeatureFlags usage = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
++                                           VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
++    return !IsFormatSupported(VK_FORMAT_R5G5B5A1_UNORM_PACK16, usage, FormatType::Optimal) &&
++           IsFormatSupported(VK_FORMAT_B5G5R5A1_UNORM_PACK16, usage, FormatType::Optimal);
++}
++
+ bool Device::GetSuitability(bool requires_swapchain) {
+     // Assume we will be suitable.
+     bool suitable = true;
+@@ -1658,6 +1683,15 @@ void Device::CollectPhysicalMemoryInfo() {
+             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
+         }
+     }
++#ifdef __SWITCH2__
++    // En Switch 2 la "VRAM" sale del mismo heap que la RAM emulada (4 GiB), la tabla de
++    // páginas (1 GiB) y el JIT: con el presupuesto de 4 GiB por defecto el proceso se quedaba
++    // sin memoria (std::bad_alloc) a los ~20 min. Con 2 GiB la caché de texturas empieza a
++    // liberar mucho antes.
++    device_access_memory = std::min<u64>(device_access_memory, 2_GiB);
++    LOG_INFO(Render_Vulkan, "Switch 2: presupuesto de VRAM limitado a {} MiB",
++             device_access_memory >> 20);
++#endif
+ }
+ 
+ void Device::CollectToolingInfo() {
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index c1f7c06..547c01d 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -986,6 +986,13 @@ FN_MAX_LIMIT_LIST
+ 
+     bool MustEmulateBGR565() const;
+ 
++    /// true si el host no muestrea R5G5B5A1 y Eden lo sustituye por B5G5R5A1 (R<->B).
++    bool MustEmulateR5G5B5A1() const;
++
++    /// true si el host no muestrea ni R5G5B5A1 ni B5G5R5A1 (OunceVK en Switch 2): las
++    /// texturas A5B5G5R1 del invitado se convierten a A8B8G8R8 en la CPU al subirlas.
++    bool MustConvertA5B5G5R1() const;
++
+     bool HasExactDepthBiasControl() const {
+         return features.depth_bias_control.depthBiasExact;
+     }
 diff --git a/src/video_core/vulkan_common/vulkan_instance.cpp b/src/video_core/vulkan_common/vulkan_instance.cpp
 index 7f3d8ed..626c85d 100644
 --- a/src/video_core/vulkan_common/vulkan_instance.cpp
