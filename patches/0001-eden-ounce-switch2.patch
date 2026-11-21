@@ -1250,6 +1250,32 @@ index b90af96..c6e4645 100644
  }
  
  } // namespace Service
+diff --git a/src/core/hle/service/set/system_settings_server.cpp b/src/core/hle/service/set/system_settings_server.cpp
+index 52642e3..73dabfe 100644
+--- a/src/core/hle/service/set/system_settings_server.cpp
++++ b/src/core/hle/service/set/system_settings_server.cpp
+@@ -471,7 +471,20 @@ bool ISystemSettingsServer::StoreSettingsFile(std::filesystem::path& path, auto&
+     }
+     file.close();
+ 
+-    std::filesystem::rename(settings_tmp_file, settings_base.replace_extension("dat"));
++    const auto settings_dat_file = settings_base.replace_extension("dat");
++    std::error_code ec;
++    std::filesystem::rename(settings_tmp_file, settings_dat_file, ec);
++    if (ec) {
++        // En la SD de Switch (FAT/exFAT vía libnx) renombrar no sobrescribe el destino:
++        // se borra el .dat viejo y se reintenta, en vez de lanzar una excepción.
++        std::filesystem::remove(settings_dat_file, ec);
++        ec.clear();
++        std::filesystem::rename(settings_tmp_file, settings_dat_file, ec);
++        if (ec) {
++            LOG_ERROR(Service_SET, "Failed to save {}: {}", settings_dat_file.string(), ec.message());
++            return false;
++        }
++    }
+ 
+     return true;
+ }
 diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
 index 01d37fb..1fbaefa 100644
 --- a/src/core/internal_network/network.cpp
