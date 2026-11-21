@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <ctime>
 
+#include <malloc.h>
+
 #include <switch.h>
 
 #include "eden_ounce/horizon.h"
@@ -18,6 +20,8 @@ extern "C" {
 alignas(16) u8 __nx_exception_stack[0x8000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 extern char __start__; // base de eden.nro (crt0 de libnx)
+extern char* fake_heap_start; // heap de newlib (lo fija libnx al arrancar)
+extern char* fake_heap_end;
 }
 
 namespace {
@@ -182,14 +186,15 @@ void InstallCrashHandler() {
 }
 
 void Breadcrumb(const char* text) {
-    u64 used = 0;
-    u64 total = 0;
-    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    // libnx reserva casi toda la memoria como heap al arrancar, así que svcGetInfo siempre dice
+    // "lleno". Lo útil es cuánto del heap está ocupado (malloc) y cuánto queda.
+    const struct mallinfo mi = mallinfo();
+    const u64 heap_size = static_cast<u64>(fake_heap_end - fake_heap_start);
+    const u64 in_use = static_cast<u64>(mi.uordblks);
     FILE* f = std::fopen(kCrashPath, "a");
     if (f) {
-        std::fprintf(f, "[%10.3f] (mem %lu/%lu MiB) %s\n",
-                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
+        std::fprintf(f, "[%10.3f] (heap %lu/%lu MiB) %s\n",
+                     static_cast<double>(MonotonicNs()) / 1e9, in_use >> 20, heap_size >> 20, text);
         std::fclose(f);
     }
 }

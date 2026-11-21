@@ -16,6 +16,17 @@ extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
             eden_ounce_breadcrumb(text);                                                           \
         }                                                                                          \
     } while (0)
+#include <string>
+#include <string_view>
+/// Igual que EDEN_CRUMB, con un nombre al final (p. ej. el del servicio).
+#define EDEN_CRUMB_NAMED(prefix, name)                                                             \
+    do {                                                                                           \
+        if (eden_ounce_breadcrumb) {                                                               \
+            const std::string eden_crumb_text = std::string{prefix} + std::string{name};           \
+            eden_ounce_breadcrumb(eden_crumb_text.c_str());                                        \
+        }                                                                                          \
+    } while (0)
 #else
 #define EDEN_CRUMB(text) ((void)0)
+#define EDEN_CRUMB_NAMED(prefix, name) ((void)0)
 #endif

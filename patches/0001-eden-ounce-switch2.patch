@@ -416,10 +416,10 @@ index e8a27a1..1d2e790 100644
  } // namespace Common::FS
 diff --git a/src/common/horizon/breadcrumb.h b/src/common/horizon/breadcrumb.h
 new file mode 100644
-index 0000000..c170631
+index 0000000..c0134e7
 --- /dev/null
 +++ b/src/common/horizon/breadcrumb.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,32 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -438,8 +438,19 @@ index 0000000..c170631
 +            eden_ounce_breadcrumb(text);                                                           \
 +        }                                                                                          \
 +    } while (0)
++#include <string>
++#include <string_view>
++/// Igual que EDEN_CRUMB, con un nombre al final (p. ej. el del servicio).
++#define EDEN_CRUMB_NAMED(prefix, name)                                                             \
++    do {                                                                                           \
++        if (eden_ounce_breadcrumb) {                                                               \
++            const std::string eden_crumb_text = std::string{prefix} + std::string{name};           \
++            eden_ounce_breadcrumb(eden_crumb_text.c_str());                                        \
++        }                                                                                          \
++    } while (0)
 +#else
 +#define EDEN_CRUMB(text) ((void)0)
++#define EDEN_CRUMB_NAMED(prefix, name) ((void)0)
 +#endif
 diff --git a/src/common/horizon/horizon_os.cpp b/src/common/horizon/horizon_os.cpp
 new file mode 100644
@@ -1191,6 +1202,54 @@ index 79fde93..8ae027a 100644
  #else
      return static_cast<u64>(timegm(&tm));
  #endif
+diff --git a/src/core/hle/service/services.cpp b/src/core/hle/service/services.cpp
+index b90af96..c6e4645 100644
+--- a/src/core/hle/service/services.cpp
++++ b/src/core/hle/service/services.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "core/hle/service/services.h"
++#include "common/horizon/breadcrumb.h"
+ 
+ #include "core/hle/service/acc/acc.h"
+ #include "core/hle/service/am/am.h"
+@@ -75,6 +76,7 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+                    std::stop_token token) {
+     auto& kernel = system.Kernel();
+ 
++    EDEN_CRUMB("Servicios: fábricas de FS");
+     system.GetFileSystemController().CreateFactories(*system.GetFilesystem(), false);
+ 
+     // Just a quick C++ lesson
+@@ -95,7 +97,14 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+         {"nvservices", &Nvidia::LoopProcess},
+         {"bsdsocket",  &Sockets::LoopProcess},
+     })
+-        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }).detach();
++    {
++        EDEN_CRUMB_NAMED("Servicios (hilo propio): lanzando ", e.first);
++        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second, n = e.first] {
++            EDEN_CRUMB_NAMED("Servicios (hilo propio): corriendo ", n);
++            f(system);
++        }).detach();
++    }
++    EDEN_CRUMB("Servicios (hilo propio): lanzando vi");
+     kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
+     // Avoid cold clones of lambdas -- succintly
+     for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
+@@ -154,7 +163,11 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
+         {"i2c",        &I2C::LoopProcess},
+         {"gpio",        &GPIO::LoopProcess},
+     })
++    {
++        EDEN_CRUMB_NAMED("Servicios (núcleo invitado): ", e.first);
+         kernel.RunOnGuestCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); });
++    }
++    EDEN_CRUMB("Servicios: todos registrados");
+ }
+ 
+ } // namespace Service
 diff --git a/src/core/internal_network/network.cpp b/src/core/internal_network/network.cpp
 index 01d37fb..1fbaefa 100644
 --- a/src/core/internal_network/network.cpp
@@ -1959,10 +2018,10 @@ index 0000000..656a2da
 +} // namespace EdenOunce
 diff --git a/src/eden_ounce/horizon.cpp b/src/eden_ounce/horizon.cpp
 new file mode 100644
-index 0000000..23a9949
+index 0000000..e479bb2
 --- /dev/null
 +++ b/src/eden_ounce/horizon.cpp
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,293 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1970,6 +2029,8 @@ index 0000000..23a9949
 +
 +#include <cstdio>
 +#include <ctime>
++
++#include <malloc.h>
 +
 +#include <switch.h>
 +
@@ -1983,6 +2044,8 @@ index 0000000..23a9949
 +alignas(16) u8 __nx_exception_stack[0x8000];
 +u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 +extern char __start__; // base de eden.nro (crt0 de libnx)
++extern char* fake_heap_start; // heap de newlib (lo fija libnx al arrancar)
++extern char* fake_heap_end;
 +}
 +
 +namespace {
@@ -2147,14 +2210,15 @@ index 0000000..23a9949
 +}
 +
 +void Breadcrumb(const char* text) {
-+    u64 used = 0;
-+    u64 total = 0;
-+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    // libnx reserva casi toda la memoria como heap al arrancar, así que svcGetInfo siempre dice
++    // "lleno". Lo útil es cuánto del heap está ocupado (malloc) y cuánto queda.
++    const struct mallinfo mi = mallinfo();
++    const u64 heap_size = static_cast<u64>(fake_heap_end - fake_heap_start);
++    const u64 in_use = static_cast<u64>(mi.uordblks);
 +    FILE* f = std::fopen(kCrashPath, "a");
 +    if (f) {
-+        std::fprintf(f, "[%10.3f] (mem %lu/%lu MiB) %s\n",
-+                     static_cast<double>(MonotonicNs()) / 1e9, used >> 20, total >> 20, text);
++        std::fprintf(f, "[%10.3f] (heap %lu/%lu MiB) %s\n",
++                     static_cast<double>(MonotonicNs()) / 1e9, in_use >> 20, heap_size >> 20, text);
 +        std::fclose(f);
 +    }
 +}
