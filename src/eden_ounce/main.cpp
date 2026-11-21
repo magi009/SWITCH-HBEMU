@@ -14,6 +14,7 @@
 //   sdmc:/switch/eden/nand/system/... (firmware dumpeado, opcional pero recomendado)
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <exception>
@@ -22,6 +23,7 @@
 #include <format>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "common/fs/fs.h"
@@ -36,6 +38,7 @@
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
+#include "video_core/renderer_base.h"
 #include "eden_ounce/emu_window_ounce.h"
 #include "eden_ounce/horizon.h"
 #include "input_common/main.h"
@@ -59,6 +62,14 @@ void ConfigureForSwitch2() {
     values.cpuopt_fastmem.SetValue(false);
     values.cpuopt_fastmem_exclusives.SetValue(false);
     values.use_multi_core.SetValue(true);
+    // Sin fastmem cada acceso a memoria ya es caro: no sumar comprobaciones de precisión.
+    // Son las mismas optimizaciones "inseguras" que usa Eden en Android.
+    values.cpu_accuracy.SetValue(CpuAccuracy::Unsafe);
+    values.cpuopt_unsafe_unfuse_fma.SetValue(true);
+    values.cpuopt_unsafe_reduce_fp_error.SetValue(true);
+    values.cpuopt_unsafe_ignore_standard_fpcr.SetValue(true);
+    values.cpuopt_unsafe_inaccurate_nan.SetValue(true);
+    values.cpuopt_unsafe_ignore_global_monitor.SetValue(true);
     // 4 GiB como la Switch 1; el pool de un juego de Switch 2 no da para más con Eden encima.
     values.memory_layout_mode.SetValue(MemoryLayout::Memory_4Gb);
 
@@ -67,6 +78,12 @@ void ConfigureForSwitch2() {
     values.resolution_setup.SetValue(ResolutionSetup::Res1X);
     values.use_disk_shader_cache.SetValue(true);
     values.use_asynchronous_gpu_emulation.SetValue(true);
+    // Eden solo pone los valores rápidos de GPU si compila para Android; aquí hay que pedirlos.
+    values.gpu_accuracy.SetValue(GpuAccuracy::Low);
+    values.use_reactive_flushing.SetValue(false);
+    values.async_presentation.SetValue(true);
+    values.max_anisotropy.SetValue(AnisotropyMode::Default);
+    values.use_vulkan_driver_pipeline_cache.SetValue(true);
     // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
     // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
     values.use_asynchronous_shaders.SetValue(true);
@@ -202,16 +219,65 @@ int RunEmulator(int argc, char** argv) {
         return 1;
     }
 
+    // Pantalla "Cargando NX": la pinta el propio renderer Vulkan hasta que el juego presente
+    // su primer fotograma (la última imagen se queda en pantalla, sin negro de por medio).
+    std::string title;
+    if (system.GetAppLoader().ReadTitle(title) != Loader::ResultStatus::Success || title.empty()) {
+        title = std::filesystem::path(filepath).stem().string();
+    }
+    u64 tick = 0;
+    const auto draw_loading = [&](const std::string& status, float progress) {
+        system.Renderer().DrawHostImage([&](std::span<u32> px, u32 w, u32 h, bool bgra) {
+            Ounce::Hos::PaintLoadingScreen(px.data(), w, h, bgra, title, status, progress, tick);
+        });
+        ++tick;
+    };
+    draw_loading("Preparando la GPU", -1.0f);
+
     system.GPU().Start();
     Ounce::Hos::Breadcrumb("GPU iniciada");
     system.GetCpuManager().OnGpuReady();
     Ounce::Hos::Breadcrumb("CpuManager listo");
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
-        system.Renderer().ReadRasterizer()->LoadDiskResources(
-            system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+        // Los shaders guardados se compilan en otro hilo; este dibuja el progreso.
+        std::atomic<int> stage{static_cast<int>(VideoCore::LoadCallbackStage::Prepare)};
+        std::atomic<size_t> built{0}, total{0};
+        std::atomic<bool> done{false};
+        std::stop_source stop;
+        std::thread loader{[&] {
+            system.Renderer().ReadRasterizer()->LoadDiskResources(
+                system.GetApplicationProcessProgramID(), stop.get_token(),
+                [&](VideoCore::LoadCallbackStage s, size_t value, size_t count) {
+                    stage = static_cast<int>(s);
+                    built = value;
+                    total = count;
+                });
+            done = true;
+        }};
+        while (!done) {
+            const auto s = static_cast<VideoCore::LoadCallbackStage>(stage.load());
+            const size_t n = built, t = total;
+            if (s == VideoCore::LoadCallbackStage::Build && t > 0) {
+                draw_loading(std::format("Cargando shaders {} / {}", n, t), float(n) / float(t));
+            } else {
+                draw_loading("Leyendo la caché de shaders", -1.0f);
+            }
+            if (!window->PumpEvents()) {
+                stop.request_stop();
+            }
+            Ounce::Hos::SleepNs(33'000'000);
+        }
+        loader.join();
+        if (stop.stop_requested()) {
+            Ounce::Hos::Breadcrumb("salida pedida durante la carga de shaders");
+            system.ShutdownMainProcess();
+            window.reset();
+            Ounce::Hos::ExitNetwork();
+            return 0;
+        }
     }
+    draw_loading("Iniciando el juego", 1.0f);
 
     Ounce::Hos::Breadcrumb("caché de shaders leída");
     system.RegisterExitCallback([&window] {

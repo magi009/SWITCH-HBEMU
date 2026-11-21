@@ -76,4 +76,10 @@ std::string PickGame(const std::string& games_dir);
 /// Muestra un error a pantalla completa hasta que se pulse +.
 void ShowFatal(const std::string& message);
 
+/// Pinta la pantalla "Cargando NX" en un búfer de píxeles u32 (la presenta Vulkan).
+/// progress: 0..1, o negativo para una barra animada sin porcentaje. tick anima la barra.
+void PaintLoadingScreen(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height,
+                        bool bgra, const std::string& title, const std::string& status,
+                        float progress, std::uint64_t tick);
+
 } // namespace Ounce::Hos

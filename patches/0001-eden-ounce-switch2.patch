@@ -2385,10 +2385,10 @@ index 0000000..a44177f
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/horizon.h b/src/eden_ounce/horizon.h
 new file mode 100644
-index 0000000..2b7804e
+index 0000000..9802a4d
 --- /dev/null
 +++ b/src/eden_ounce/horizon.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,85 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2467,13 +2467,19 @@ index 0000000..2b7804e
 +/// Muestra un error a pantalla completa hasta que se pulse +.
 +void ShowFatal(const std::string& message);
 +
++/// Pinta la pantalla "Cargando NX" en un búfer de píxeles u32 (la presenta Vulkan).
++/// progress: 0..1, o negativo para una barra animada sin porcentaje. tick anima la barra.
++void PaintLoadingScreen(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height,
++                        bool bgra, const std::string& title, const std::string& status,
++                        float progress, std::uint64_t tick);
++
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/launcher.cpp b/src/eden_ounce/launcher.cpp
 new file mode 100644
-index 0000000..f883d4e
+index 0000000..83cfd1f
 --- /dev/null
 +++ b/src/eden_ounce/launcher.cpp
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,249 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2590,12 +2596,145 @@ index 0000000..f883d4e
 +}
 +
 +} // namespace Ounce::Hos
++
++// ------------------------------------------------------------------ pantalla de carga
++namespace Ounce::Hos {
++namespace {
++
++// UTF-8 -> página de códigos 437 (la fuente de la consola de libnx), para las tildes.
++std::string ToCp437(const std::string& in) {
++    std::string out;
++    for (size_t i = 0; i < in.size(); ++i) {
++        const unsigned char c = static_cast<unsigned char>(in[i]);
++        if (c < 0x80) {
++            out += static_cast<char>(c);
++            continue;
++        }
++        if ((c & 0xE0) == 0xC0 && i + 1 < in.size()) {
++            const unsigned cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(in[++i]) & 0x3F);
++            switch (cp) {
++            case 0xE1: out += '\xA0'; break; // á
++            case 0xE9: out += '\x82'; break; // é
++            case 0xED: out += '\xA1'; break; // í
++            case 0xF3: out += '\xA2'; break; // ó
++            case 0xFA: out += '\xA3'; break; // ú
++            case 0xF1: out += '\xA4'; break; // ñ
++            case 0xD1: out += '\xA5'; break; // Ñ
++            case 0xFC: out += '\x81'; break; // ü
++            case 0xC9: out += '\x90'; break; // É
++            case 0xBF: out += '\xA8'; break; // ¿
++            case 0xA1: out += '\xAD'; break; // ¡
++            default: out += '?'; break;
++            }
++            continue;
++        }
++        // Secuencias de 3-4 bytes (™, ®...): se saltan.
++        while (i + 1 < in.size() && (static_cast<unsigned char>(in[i + 1]) & 0xC0) == 0x80) {
++            ++i;
++        }
++    }
++    return out;
++}
++
++struct Canvas {
++    std::uint32_t* px;
++    std::uint32_t w, h;
++    bool bgra;
++
++    std::uint32_t Color(std::uint32_t rgb) const {
++        const std::uint32_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
++        return bgra ? (0xFF000000u | (r << 16) | (g << 8) | b) : (0xFF000000u | (b << 16) | (g << 8) | r);
++    }
++    void Rect(int x, int y, int rw, int rh, std::uint32_t rgb) const {
++        const std::uint32_t c = Color(rgb);
++        for (int j = std::max(0, y); j < std::min<int>(h, y + rh); ++j) {
++            for (int i = std::max(0, x); i < std::min<int>(w, x + rw); ++i) {
++                px[size_t(j) * w + i] = c;
++            }
++        }
++    }
++    // Glifos de 16x16 de la fuente de libnx: fila r = palabra r, bit 15-i = columna i.
++    void Text(int x, int y, const std::string& utf8, int scale, std::uint32_t rgb) const {
++        const auto* font = static_cast<const std::uint16_t*>(consoleGetDefault()->font.gfx);
++        const std::uint32_t c = Color(rgb);
++        const std::string text = ToCp437(utf8);
++        for (size_t n = 0; n < text.size(); ++n) {
++            const std::uint16_t* glyph = font + 16 * static_cast<unsigned char>(text[n]);
++            const int gx = x + int(n) * 16 * scale;
++            for (int r = 0; r < 16; ++r) {
++                for (int i = 0; i < 16; ++i) {
++                    if (!(glyph[r] & (0x8000 >> i))) {
++                        continue;
++                    }
++                    for (int sy = 0; sy < scale; ++sy) {
++                        const int py = y + r * scale + sy;
++                        if (py < 0 || py >= int(h)) continue;
++                        for (int sx = 0; sx < scale; ++sx) {
++                            const int pxx = gx + i * scale + sx;
++                            if (pxx >= 0 && pxx < int(w)) px[size_t(py) * w + pxx] = c;
++                        }
++                    }
++                }
++            }
++        }
++    }
++    static int TextWidth(const std::string& utf8, int scale) {
++        return int(ToCp437(utf8).size()) * 16 * scale;
++    }
++    void Centered(int y, const std::string& text, int scale, std::uint32_t rgb) const {
++        Text((int(w) - TextWidth(text, scale)) / 2, y, text, scale, rgb);
++    }
++};
++
++} // namespace
++
++void PaintLoadingScreen(std::uint32_t* pixels, std::uint32_t width, std::uint32_t height,
++                        bool bgra, const std::string& title, const std::string& status,
++                        float progress, std::uint64_t tick) {
++    const Canvas cv{pixels, width, height, bgra};
++    const float k = float(height) / 720.0f; // tamaños pensados para 720p
++    const int big = std::max(1, int(4 * k + 0.5f));
++    const int mid = std::max(1, int(2 * k + 0.5f));
++
++    cv.Rect(0, 0, int(width), int(height), 0x0F1216);
++
++    const int title_y = int(height * 0.30f);
++    const std::string dots(1 + (tick / 8) % 3, '.');
++    const std::string head = "Cargando NX";
++    // Puntos animados fuera del centrado, para que el texto no baile.
++    const int head_x = (int(width) - Canvas::TextWidth(head, big)) / 2;
++    cv.Text(head_x, title_y, head + dots, big, 0xFFFFFF);
++
++    std::string game = title;
++    const size_t max_chars = size_t(width / (16 * mid)) - 4;
++    if (game.size() > max_chars) game = game.substr(0, max_chars - 3) + "...";
++    cv.Centered(title_y + 16 * big + int(24 * k), game, mid, 0x00C3E3);
++
++    const int bar_w = int(width * 0.6f);
++    const int bar_h = std::max(6, int(14 * k));
++    const int bar_x = (int(width) - bar_w) / 2;
++    const int bar_y = int(height * 0.62f);
++    cv.Rect(bar_x, bar_y, bar_w, bar_h, 0x2A3038);
++    if (progress >= 0.0f) {
++        const float p = std::min(progress, 1.0f);
++        cv.Rect(bar_x, bar_y, int(bar_w * p), bar_h, 0x00C3E3);
++    } else {
++        const int seg = bar_w / 4;
++        const int pos = int((tick * 12) % size_t(bar_w + seg)) - seg;
++        cv.Rect(std::max(bar_x, bar_x + pos), bar_y,
++                std::min(seg, bar_w - std::max(0, pos)) + std::min(0, pos), bar_h, 0x00C3E3);
++    }
++    cv.Centered(bar_y + bar_h + int(20 * k), status, mid, 0xB8C0CC);
++    cv.Centered(int(height) - int(48 * k), "Eden para Switch 2", std::max(1, mid - 1), 0x5A6470);
++}
++
++} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..313fae1
+index 0000000..a4e530b
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,325 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2612,6 +2751,7 @@ index 0000000..313fae1
 +//   sdmc:/switch/eden/nand/system/... (firmware dumpeado, opcional pero recomendado)
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cctype>
 +#include <cstdlib>
 +#include <exception>
@@ -2620,6 +2760,7 @@ index 0000000..313fae1
 +#include <format>
 +#include <string>
 +#include <system_error>
++#include <thread>
 +#include <vector>
 +
 +#include "common/fs/fs.h"
@@ -2634,6 +2775,7 @@ index 0000000..313fae1
 +#include "core/hle/service/am/applet_manager.h"
 +#include "core/hle/service/filesystem/filesystem.h"
 +#include "core/loader/loader.h"
++#include "video_core/renderer_base.h"
 +#include "eden_ounce/emu_window_ounce.h"
 +#include "eden_ounce/horizon.h"
 +#include "input_common/main.h"
@@ -2657,6 +2799,14 @@ index 0000000..313fae1
 +    values.cpuopt_fastmem.SetValue(false);
 +    values.cpuopt_fastmem_exclusives.SetValue(false);
 +    values.use_multi_core.SetValue(true);
++    // Sin fastmem cada acceso a memoria ya es caro: no sumar comprobaciones de precisión.
++    // Son las mismas optimizaciones "inseguras" que usa Eden en Android.
++    values.cpu_accuracy.SetValue(CpuAccuracy::Unsafe);
++    values.cpuopt_unsafe_unfuse_fma.SetValue(true);
++    values.cpuopt_unsafe_reduce_fp_error.SetValue(true);
++    values.cpuopt_unsafe_ignore_standard_fpcr.SetValue(true);
++    values.cpuopt_unsafe_inaccurate_nan.SetValue(true);
++    values.cpuopt_unsafe_ignore_global_monitor.SetValue(true);
 +    // 4 GiB como la Switch 1; el pool de un juego de Switch 2 no da para más con Eden encima.
 +    values.memory_layout_mode.SetValue(MemoryLayout::Memory_4Gb);
 +
@@ -2665,6 +2815,12 @@ index 0000000..313fae1
 +    values.resolution_setup.SetValue(ResolutionSetup::Res1X);
 +    values.use_disk_shader_cache.SetValue(true);
 +    values.use_asynchronous_gpu_emulation.SetValue(true);
++    // Eden solo pone los valores rápidos de GPU si compila para Android; aquí hay que pedirlos.
++    values.gpu_accuracy.SetValue(GpuAccuracy::Low);
++    values.use_reactive_flushing.SetValue(false);
++    values.async_presentation.SetValue(true);
++    values.max_anisotropy.SetValue(AnisotropyMode::Default);
++    values.use_vulkan_driver_pipeline_cache.SetValue(true);
 +    // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
 +    // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
 +    values.use_asynchronous_shaders.SetValue(true);
@@ -2800,16 +2956,65 @@ index 0000000..313fae1
 +        return 1;
 +    }
 +
++    // Pantalla "Cargando NX": la pinta el propio renderer Vulkan hasta que el juego presente
++    // su primer fotograma (la última imagen se queda en pantalla, sin negro de por medio).
++    std::string title;
++    if (system.GetAppLoader().ReadTitle(title) != Loader::ResultStatus::Success || title.empty()) {
++        title = std::filesystem::path(filepath).stem().string();
++    }
++    u64 tick = 0;
++    const auto draw_loading = [&](const std::string& status, float progress) {
++        system.Renderer().DrawHostImage([&](std::span<u32> px, u32 w, u32 h, bool bgra) {
++            Ounce::Hos::PaintLoadingScreen(px.data(), w, h, bgra, title, status, progress, tick);
++        });
++        ++tick;
++    };
++    draw_loading("Preparando la GPU", -1.0f);
++
 +    system.GPU().Start();
 +    Ounce::Hos::Breadcrumb("GPU iniciada");
 +    system.GetCpuManager().OnGpuReady();
 +    Ounce::Hos::Breadcrumb("CpuManager listo");
 +
 +    if (Settings::values.use_disk_shader_cache.GetValue()) {
-+        system.Renderer().ReadRasterizer()->LoadDiskResources(
-+            system.GetApplicationProcessProgramID(), std::stop_token{},
-+            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
++        // Los shaders guardados se compilan en otro hilo; este dibuja el progreso.
++        std::atomic<int> stage{static_cast<int>(VideoCore::LoadCallbackStage::Prepare)};
++        std::atomic<size_t> built{0}, total{0};
++        std::atomic<bool> done{false};
++        std::stop_source stop;
++        std::thread loader{[&] {
++            system.Renderer().ReadRasterizer()->LoadDiskResources(
++                system.GetApplicationProcessProgramID(), stop.get_token(),
++                [&](VideoCore::LoadCallbackStage s, size_t value, size_t count) {
++                    stage = static_cast<int>(s);
++                    built = value;
++                    total = count;
++                });
++            done = true;
++        }};
++        while (!done) {
++            const auto s = static_cast<VideoCore::LoadCallbackStage>(stage.load());
++            const size_t n = built, t = total;
++            if (s == VideoCore::LoadCallbackStage::Build && t > 0) {
++                draw_loading(std::format("Cargando shaders {} / {}", n, t), float(n) / float(t));
++            } else {
++                draw_loading("Leyendo la caché de shaders", -1.0f);
++            }
++            if (!window->PumpEvents()) {
++                stop.request_stop();
++            }
++            Ounce::Hos::SleepNs(33'000'000);
++        }
++        loader.join();
++        if (stop.stop_requested()) {
++            Ounce::Hos::Breadcrumb("salida pedida durante la carga de shaders");
++            system.ShutdownMainProcess();
++            window.reset();
++            Ounce::Hos::ExitNetwork();
++            return 0;
++        }
 +    }
++    draw_loading("Iniciando el juego", 1.0f);
 +
 +    Ounce::Hos::Breadcrumb("caché de shaders leída");
 +    system.RegisterExitCallback([&window] {
@@ -3101,6 +3306,31 @@ index 64d14ab..ba0dc23 100644
  target_link_options(video_core PRIVATE ${FFmpeg_LDFLAGS})
  
  add_dependencies(video_core host_shaders)
+diff --git a/src/video_core/renderer_base.h b/src/video_core/renderer_base.h
+index ea45ab2..7df0f13 100644
+--- a/src/video_core/renderer_base.h
++++ b/src/video_core/renderer_base.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <functional>
+ #include <memory>
++#include <span>
+ 
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+@@ -48,6 +49,12 @@ public:
+ 
+     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
+ 
++    /// Pinta una imagen del frontend (p. ej. una pantalla de carga) y la presenta, mientras el
++    /// juego todavía no dibuja nada. `bgra` dice el orden de bytes de cada píxel u32.
++    /// Solo debe llamarse cuando el juego no está presentando (antes de System::Run).
++    using HostImagePainter = std::function<void(std::span<u32> pixels, u32 width, u32 height, bool bgra)>;
++    virtual void DrawHostImage(const HostImagePainter& paint) {}
++
+     // Getter/setter functions:
+     // ------------------------
+ 
 diff --git a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp b/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
 index 6c18ade..f301ee7 100644
 --- a/src/video_core/renderer_vulkan/maxwell_to_vk.cpp
@@ -3116,6 +3346,168 @@ index 6c18ade..f301ee7 100644
      if (!device.IsOptimalBcnSupported() && VideoCore::Surface::IsPixelFormatBCn(pixel_format)) {
          // Transcode on hardware that doesn't support BCn natively
          if (pixel_format == PixelFormat::BC4_SNORM) {
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index e81e4b0..2f71128 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -212,6 +212,101 @@ RendererVulkan::~RendererVulkan() {
+     void(device.GetLogical().WaitIdle());
+ }
+ 
++void RendererVulkan::DrawHostImage(const HostImagePainter& paint) {
++    if (!render_window.IsShown()) {
++        return;
++    }
++    Frame* frame = present_manager.GetRenderFrame();
++    blit_swapchain.PrepareHostFrame(device, frame, render_window.GetFramebufferLayout());
++    const u32 width = frame->width;
++    const u32 height = frame->height;
++    if (width == 0 || height == 0 || !frame->image) {
++        return;
++    }
++    const size_t size = size_t{width} * height * sizeof(u32);
++    // Un solo búfer de subida: se espera a la GPU antes de volver a escribirlo.
++    scheduler.Finish();
++    if (!host_image_buffer || host_image_size != size) {
++        host_image_buffer = memory_allocator.CreateBuffer(
++            VkBufferCreateInfo{
++                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                .pNext = nullptr,
++                .flags = 0,
++                .size = size,
++                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++                .queueFamilyIndexCount = 0,
++                .pQueueFamilyIndices = nullptr,
++            },
++            MemoryUsage::Upload);
++        host_image_size = size;
++    }
++    const VkFormat format = swapchain.GetImageFormat();
++    const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
++    auto mapped = host_image_buffer.Mapped();
++    paint(std::span<u32>(reinterpret_cast<u32*>(mapped.data()), size_t{width} * height), width,
++          height, bgra);
++    host_image_buffer.Flush();
++
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([buffer = *host_image_buffer, image = *frame->image, width,
++                      height](vk::CommandBuffer cmdbuf) {
++        const VkImageSubresourceRange range{
++            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++            .baseMipLevel = 0,
++            .levelCount = 1,
++            .baseArrayLayer = 0,
++            .layerCount = 1,
++        };
++        const VkImageMemoryBarrier to_dst{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = 0,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = image,
++            .subresourceRange = range,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               0, to_dst);
++        const VkBufferImageCopy copy{
++            .bufferOffset = 0,
++            .bufferRowLength = 0,
++            .bufferImageHeight = 0,
++            .imageSubresource =
++                {
++                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                    .mipLevel = 0,
++                    .baseArrayLayer = 0,
++                    .layerCount = 1,
++                },
++            .imageOffset = {0, 0, 0},
++            .imageExtent = {width, height, 1},
++        };
++        cmdbuf.CopyBufferToImage(buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
++        // PresentManager espera la imagen del frame en GENERAL.
++        const VkImageMemoryBarrier to_general{
++            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
++            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = image,
++            .subresourceRange = range,
++        };
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               0, to_general);
++    });
++    scheduler.Flush(*frame->render_ready);
++    present_manager.Present(frame);
++}
++
+ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+     SCOPE_EXIT {
+         render_window.OnFrameDisplayed();
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.h b/src/video_core/renderer_vulkan/renderer_vulkan.h
+index 87422dd..3df1325 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -51,6 +51,8 @@ public:
+ 
+     std::vector<u8> GetAppletCaptureBuffer() override;
+ 
++    void DrawHostImage(const HostImagePainter& paint) override;
++
+     VideoCore::RasterizerInterface* ReadRasterizer() override {
+         return &rasterizer;
+     }
+@@ -107,6 +109,9 @@ private:
+     std::optional<TurboMode> turbo_mode;
+ 
+     Frame applet_frame;
++
++    vk::Buffer host_image_buffer;
++    size_t host_image_size{};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_blit_screen.cpp b/src/video_core/renderer_vulkan/vk_blit_screen.cpp
+index 4228440..310ebb8 100644
+--- a/src/video_core/renderer_vulkan/vk_blit_screen.cpp
++++ b/src/video_core/renderer_vulkan/vk_blit_screen.cpp
+@@ -102,6 +102,14 @@ void BlitScreen::PrepareFrame(const Device& device, Frame* frame,
+                                   window_adapt->GetRenderPass(), true);
+ }
+ 
++void BlitScreen::PrepareHostFrame(const Device& device, Frame* frame,
++                                  const Layout::FramebufferLayout& layout) {
++    if (!window_adapt) {
++        SetWindowAdaptPass(device);
++    }
++    PrepareFrame(device, frame, layout);
++}
++
+ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer, Frame* frame,
+                              std::span<const Tegra::FramebufferConfig> framebuffers,
+                              const Layout::FramebufferLayout& layout,
+diff --git a/src/video_core/renderer_vulkan/vk_blit_screen.h b/src/video_core/renderer_vulkan/vk_blit_screen.h
+index 719e348..e240af0 100644
+--- a/src/video_core/renderer_vulkan/vk_blit_screen.h
++++ b/src/video_core/renderer_vulkan/vk_blit_screen.h
+@@ -62,6 +62,9 @@ public:
+ 
+     void PrepareFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
+ 
++    /// Como PrepareFrame, pero sirve antes del primer DrawToFrame (crea el pase de ventana).
++    void PrepareHostFrame(const Device& device, Frame* frame, const Layout::FramebufferLayout& layout);
++
+     /// Draws the overlay panels on top (the screen's pass only: never in a screenshot or the
+     /// applets' capture)
+     void DrawOverlayPanels(bool draw) {
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 index ab82c3f..0eae4b1 100644
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
