@@ -6,6 +6,7 @@
 #include "dynarmic/backend/arm64/horizon_code_block.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <new>
@@ -14,6 +15,21 @@
 #include <kaihen.h>
 
 extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
+
+// Estadísticas del JIT para el frontend (latidos de crash.txt): cuántas publicaciones
+// por IPC a kaiHEN, cuántos bytes y cuánto tiempo se fue en ellas.
+namespace {
+std::atomic<std::uint64_t> g_publish_count{0};
+std::atomic<std::uint64_t> g_publish_bytes{0};
+std::atomic<std::uint64_t> g_publish_ns{0};
+} // namespace
+
+extern "C" void eden_ounce_jit_stats(std::uint64_t* count, std::uint64_t* bytes,
+                                     std::uint64_t* ns) {
+    *count = g_publish_count.load(std::memory_order_relaxed);
+    *bytes = g_publish_bytes.load(std::memory_order_relaxed);
+    *ns = g_publish_ns.load(std::memory_order_relaxed);
+}
 
 namespace Dynarmic::Backend::Arm64 {
 
@@ -88,8 +104,16 @@ void HorizonCodeBlock::Publish() {
         first_publish = false;
         Crumb("JIT kaiHEN: primera publicación de código");
     }
+    std::uint64_t bytes = 0;
+    for (const Range& r : m_dirty) {
+        bytes += r.size;
+    }
+    const u64 t0 = armGetSystemTick();
     const Result rc = kaihenJitPublishRanges(
         &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
+    g_publish_ns.fetch_add(armTicksToNs(armGetSystemTick() - t0), std::memory_order_relaxed);
+    g_publish_count.fetch_add(1, std::memory_order_relaxed);
+    g_publish_bytes.fetch_add(bytes, std::memory_order_relaxed);
     if (R_FAILED(rc)) {
         // Sin publicación el invitado ejecutaría código viejo: mejor abortar ya.
         diagAbortWithResult(rc);

@@ -30,6 +30,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/cpu_manager.h"
+#include "core/perf_stats.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
@@ -66,6 +67,9 @@ void ConfigureForSwitch2() {
     values.resolution_setup.SetValue(ResolutionSetup::Res1X);
     values.use_disk_shader_cache.SetValue(true);
     values.use_asynchronous_gpu_emulation.SetValue(true);
+    // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
+    // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
+    values.use_asynchronous_shaders.SetValue(true);
     // NVDEC por CPU necesita FFmpeg; desactivado hasta portarlo (los vídeos salen en negro).
     values.nvdec_emulation.SetValue(NvdecEmulation::Off);
     // Fase 1: sin backend de audio nativo todavía.
@@ -87,6 +91,8 @@ bool CheckKeys(std::string& error) {
 }
 
 } // namespace
+
+extern "C" void eden_ounce_jit_stats(u64* count, u64* bytes, u64* ns) __attribute__((weak));
 
 namespace {
 
@@ -115,9 +121,9 @@ int RunEmulator(int argc, char** argv);
 } // namespace
 
 int main(int argc, char** argv) {
-    // Mientras depuramos en la consola: cada línea del log se escribe en la SD al instante,
-    // para que un cierre brusco no se lleve las últimas líneas.
-    Settings::values.log_flush_line.SetValue(true);
+    // El log ya no se escribe línea a línea (frenaba la emulación con escrituras a la SD);
+    // las migas de pan de crash.txt siguen siendo inmediatas.
+    Settings::values.log_flush_line.SetValue(false);
     Ounce::Hos::InstallCrashHandler();
     std::set_terminate(OnTerminate);
     try {
@@ -221,8 +227,17 @@ int RunEmulator(int argc, char** argv) {
     u64 loops = 0;
     while (window->PumpEvents()) {
         Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
-        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo
-            const std::string beat = std::format("latido {} s", loops / 250);
+        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo + rendimiento
+            const auto perf = system.GetAndResetPerfStats();
+            u64 jit_count = 0, jit_bytes = 0, jit_ns = 0;
+            if (eden_ounce_jit_stats) {
+                eden_ounce_jit_stats(&jit_count, &jit_bytes, &jit_ns);
+            }
+            const std::string beat = std::format(
+                "latido {} s | velocidad {:.0f}% | juego {:.1f} FPS | JIT: {} publicaciones, "
+                "{} KiB, {:.1f} s en IPC",
+                loops / 250, perf.emulation_speed * 100.0, perf.average_game_fps, jit_count,
+                jit_bytes >> 10, static_cast<double>(jit_ns) / 1e9);
             Ounce::Hos::Breadcrumb(beat.c_str());
         }
     }

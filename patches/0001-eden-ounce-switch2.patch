@@ -1544,10 +1544,10 @@ index 755b05b..0af6999 100644
      // A IR::LocationDescriptor will have one current CodePtr.
 diff --git a/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
 new file mode 100644
-index 0000000..2c70934
+index 0000000..624c889
 --- /dev/null
 +++ b/src/dynarmic/src/dynarmic/backend/arm64/horizon_code_block.cpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,124 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -1556,6 +1556,7 @@ index 0000000..2c70934
 +#include "dynarmic/backend/arm64/horizon_code_block.h"
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cstddef>
 +#include <cstdio>
 +#include <new>
@@ -1564,6 +1565,21 @@ index 0000000..2c70934
 +#include <kaihen.h>
 +
 +extern "C" void eden_ounce_breadcrumb(const char* text) __attribute__((weak));
++
++// Estadísticas del JIT para el frontend (latidos de crash.txt): cuántas publicaciones
++// por IPC a kaiHEN, cuántos bytes y cuánto tiempo se fue en ellas.
++namespace {
++std::atomic<std::uint64_t> g_publish_count{0};
++std::atomic<std::uint64_t> g_publish_bytes{0};
++std::atomic<std::uint64_t> g_publish_ns{0};
++} // namespace
++
++extern "C" void eden_ounce_jit_stats(std::uint64_t* count, std::uint64_t* bytes,
++                                     std::uint64_t* ns) {
++    *count = g_publish_count.load(std::memory_order_relaxed);
++    *bytes = g_publish_bytes.load(std::memory_order_relaxed);
++    *ns = g_publish_ns.load(std::memory_order_relaxed);
++}
 +
 +namespace Dynarmic::Backend::Arm64 {
 +
@@ -1638,8 +1654,16 @@ index 0000000..2c70934
 +        first_publish = false;
 +        Crumb("JIT kaiHEN: primera publicación de código");
 +    }
++    std::uint64_t bytes = 0;
++    for (const Range& r : m_dirty) {
++        bytes += r.size;
++    }
++    const u64 t0 = armGetSystemTick();
 +    const Result rc = kaihenJitPublishRanges(
 +        &m_impl->jit, reinterpret_cast<const KaihenJitRange*>(m_dirty.data()), m_dirty.size());
++    g_publish_ns.fetch_add(armTicksToNs(armGetSystemTick() - t0), std::memory_order_relaxed);
++    g_publish_count.fetch_add(1, std::memory_order_relaxed);
++    g_publish_bytes.fetch_add(bytes, std::memory_order_relaxed);
 +    if (R_FAILED(rc)) {
 +        // Sin publicación el invitado ejecutaría código viejo: mejor abortar ya.
 +        diagAbortWithResult(rc);
@@ -2563,10 +2587,10 @@ index 0000000..f883d4e
 +} // namespace Ounce::Hos
 diff --git a/src/eden_ounce/main.cpp b/src/eden_ounce/main.cpp
 new file mode 100644
-index 0000000..977ccb9
+index 0000000..313fae1
 --- /dev/null
 +++ b/src/eden_ounce/main.cpp
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,259 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -2599,6 +2623,7 @@ index 0000000..977ccb9
 +#include "common/settings.h"
 +#include "core/core.h"
 +#include "core/cpu_manager.h"
++#include "core/perf_stats.h"
 +#include "core/file_sys/registered_cache.h"
 +#include "core/file_sys/vfs/vfs_real.h"
 +#include "core/hle/service/am/applet_manager.h"
@@ -2635,6 +2660,9 @@ index 0000000..977ccb9
 +    values.resolution_setup.SetValue(ResolutionSetup::Res1X);
 +    values.use_disk_shader_cache.SetValue(true);
 +    values.use_asynchronous_gpu_emulation.SetValue(true);
++    // Compilar shaders en segundo plano: el juego no se detiene esperando a NVK la primera
++    // vez que ve un shader (puede faltar algún objeto un instante, en vez de congelarse).
++    values.use_asynchronous_shaders.SetValue(true);
 +    // NVDEC por CPU necesita FFmpeg; desactivado hasta portarlo (los vídeos salen en negro).
 +    values.nvdec_emulation.SetValue(NvdecEmulation::Off);
 +    // Fase 1: sin backend de audio nativo todavía.
@@ -2656,6 +2684,8 @@ index 0000000..977ccb9
 +}
 +
 +} // namespace
++
++extern "C" void eden_ounce_jit_stats(u64* count, u64* bytes, u64* ns) __attribute__((weak));
 +
 +namespace {
 +
@@ -2684,9 +2714,9 @@ index 0000000..977ccb9
 +} // namespace
 +
 +int main(int argc, char** argv) {
-+    // Mientras depuramos en la consola: cada línea del log se escribe en la SD al instante,
-+    // para que un cierre brusco no se lleve las últimas líneas.
-+    Settings::values.log_flush_line.SetValue(true);
++    // El log ya no se escribe línea a línea (frenaba la emulación con escrituras a la SD);
++    // las migas de pan de crash.txt siguen siendo inmediatas.
++    Settings::values.log_flush_line.SetValue(false);
 +    Ounce::Hos::InstallCrashHandler();
 +    std::set_terminate(OnTerminate);
 +    try {
@@ -2790,8 +2820,17 @@ index 0000000..977ccb9
 +    u64 loops = 0;
 +    while (window->PumpEvents()) {
 +        Ounce::Hos::SleepNs(4'000'000); // 4 ms: suficiente para entrada a 240 Hz
-+        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo
-+            const std::string beat = std::format("latido {} s", loops / 250);
++        if (++loops % 1250 == 0) { // ~cada 5 s: el hilo principal sigue vivo + rendimiento
++            const auto perf = system.GetAndResetPerfStats();
++            u64 jit_count = 0, jit_bytes = 0, jit_ns = 0;
++            if (eden_ounce_jit_stats) {
++                eden_ounce_jit_stats(&jit_count, &jit_bytes, &jit_ns);
++            }
++            const std::string beat = std::format(
++                "latido {} s | velocidad {:.0f}% | juego {:.1f} FPS | JIT: {} publicaciones, "
++                "{} KiB, {:.1f} s en IPC",
++                loops / 250, perf.emulation_speed * 100.0, perf.average_game_fps, jit_count,
++                jit_bytes >> 10, static_cast<double>(jit_ns) / 1e9);
 +            Ounce::Hos::Breadcrumb(beat.c_str());
 +        }
 +    }
